@@ -297,7 +297,13 @@ class Bridge(Node):
             target=DATA/'maps'/(name+'.pcd');target.parent.mkdir(parents=True,exist_ok=True)
             points=np.asarray(self.latest_cloud_map,dtype='<f4')
             self.write_pcd(target,points)
-            response.update(ok=True,name=name,pcd=str(target),points=int(len(points)),bytes=target.stat().st_size)
+            # NumPy twin for the localization stack: exact float32 dump of the
+            # same map_level cloud, loaded with np.load(..., mmap_mode="r").
+            npy=target.with_suffix('.npy')
+            npy_tmp=Path(str(npy)+'.tmp')
+            np.save(npy_tmp,points)
+            os.replace(npy_tmp,npy)
+            response.update(ok=True,name=name,pcd=str(target),npy=str(npy),points=int(len(points)),bytes=target.stat().st_size)
         except Exception as exc:response['error']=str(exc)
         atomic_json(RUNTIME/'cloud_save_response.json',response)
     def write_pcd(self,target,points):

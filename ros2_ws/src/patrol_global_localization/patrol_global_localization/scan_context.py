@@ -94,7 +94,10 @@ def search(database, query_sc, topk=5):
     # Coarse pass: circular cross-correlation of ring keys via FFT.
     coarse = []
     for entry in database:
-        rk = entry['ring_key']
+        rk = entry.get('ring_key')
+        if rk is None:  # defensive: callers may pass bare descriptors
+            rk = ring_key(entry['sc'])
+            entry['ring_key'] = rk
         corr = np.fft.irfft(np.fft.rfft(query_ring) * np.conj(np.fft.rfft(rk)), len(rk))
         coarse.append(float(corr.max()))
     order = np.argsort(coarse)[::-1][:max(topk * 4, 20)]

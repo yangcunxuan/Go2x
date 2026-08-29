@@ -7,6 +7,8 @@ import mimetypes
 import os
 import signal
 import struct
+
+import numpy as np
 import subprocess
 import threading
 import time
@@ -250,48 +252,100 @@ def save_cloud_map(name):
     safe = "".join(char for char in name if char.isalnum() or char in "_-" or "\u4e00" <= char <= "\u9fff")[:40]
     if not safe:
         safe = time.strftime("map_%Y%m%d_%H%M%S")
+    # P0 audit #2: session must be read before anything that uses it.
+    session = read_json(MAPPING_SESSION_FILE, {})
+    session_id = session.get("id", "")
     request_id = uuid.uuid4().hex
     write_json(CLOUD_SAVE_REQUEST, {"id": request_id, "name": safe, "created_at": time.time()})
     deadline = time.time() + 15
     while time.time() < deadline:
         response = read_json(CLOUD_SAVE_RESPONSE, {})
-        if response.get("id") == request_id:
-            if not response.get("ok"):
-                raise RuntimeError(response.get("error", "三维地图保存失败"))
-            command = ["docker-compose", "run", "--rm", "ros2", "python3",
-                       "/project/scripts/pcd_to_nav_map.py", response["pcd"]]
-            projection = subprocess.run(command, cwd=PROJECT, capture_output=True, text=True, timeout=60)
-            if projection.returncode:
-                response["nav_error"] = (projection.stderr or projection.stdout or "导航层生成失败")[-500:]
-            else:
-                response["nav_map"] = json.loads(projection.stdout.strip().splitlines()[-1])
-            # Plan A: build the Scan Context keyframe database from the saved
-            # PCD + the trajectory recorded during mapping. Non-fatal: a map
-            # without a DB simply cannot be used for global relocalization.
-            db_command = ["docker-compose", "run", "--rm", "ros2", "bash", "-c",
-                          "PYTHONPATH=/project/ros2_ws/src/patrol_global_localization "
-                          "python3 -m patrol_global_localization.build_map_db "
-                          f"{safe} {response['pcd']} "
-                          f"/project/runtime/trajectory_{session.get('id','')[:8]}.json"]
-            db_run = subprocess.run(db_command, cwd=PROJECT, capture_output=True,
-                                    text=True, timeout=300)
-            if db_run.returncode:
-                response["db_error"] = (db_run.stderr or db_run.stdout or
-                                        "关键帧数据库生成失败")[-300:]
-            session = read_json(MAPPING_SESSION_FILE, {})
-            meta = {"name": safe, "session_id": session.get("id"), "session_started_at": session.get("started_at"),
-                    "saved_at": time.time(), "coordinate_frame": "map_level"}
-            write_json(DATA / "maps" / f"{safe}.meta.json", meta)
-            points = read_json(CHECKPOINTS_FILE, [])
-            changed = False
-            for point in points:
-                if session.get("id") and point.get("session_id") == session.get("id"):
-                    point["map_name"] = safe; changed = True
-            if changed: write_json(CHECKPOINTS_FILE, points)
-            write_json(ACTIVE_MAP_FILE, {"name": safe, "updated_at": time.time()})
-            response["session_id"] = session.get("id")
-            return response
-        time.sleep(0.15)
+        if response.get("id") != request_id:
+            time.sleep(0.15)
+            continue
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "三维地图保存失败"))
+        # The bridge wrote maps/<safe>.pcd + maps/<safe>.npy (map_level).
+        pcd_flat = DATA / "maps" / f"{safe}.pcd"
+        npy_flat = DATA / "maps" / f"{safe}.npy"
+        if not pcd_flat.is_file() or pcd_flat.stat().st_size < 400:
+            raise RuntimeError("保存的点云为空或过小，已中止")
+        map_id = safe
+        staging = DATA / "maps" / f".staging_{map_id}_{os.getpid()}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        shutil.move(str(pcd_flat), str(staging / "map.pcd"))
+        if npy_flat.is_file():
+            shutil.move(str(npy_flat), str(staging / "map.npy"))
+        # 2D navigation layer (PGM/YAML) from the PCD; failure keeps the map
+        # viewable but not nav-grid-checked.
+        projection = subprocess.run(
+            ["docker-compose", "run", "--rm", "ros2", "python3",
+             "/project/scripts/pcd_to_nav_map.py", str(staging / "map.pcd")],
+            cwd=PROJECT, capture_output=True, text=True, timeout=120)
+        nav_ok = projection.returncode == 0
+        if not nav_ok:
+            response["nav_error"] = (projection.stderr or projection.stdout or "导航层生成失败")[-500:]
+        # Keyframe trajectory recorded by keyframe_saver during the session.
+        trajectory_src = RUNTIME / f"trajectory_{session_id[:8]}.json"
+        trajectory_ok = trajectory_src.is_file()
+        if trajectory_ok:
+            shutil.copy(str(trajectory_src), str(staging / "trajectory.json"))
+        # Plan A database: descriptors + keyframe poses from map.npy.
+        localization_ready = False
+        if trajectory_ok:
+            db_run = subprocess.run(
+                ["docker-compose", "run", "--rm", "ros2", "bash", "-c",
+                 "PYTHONPATH=/project/ros2_ws/src/patrol_global_localization "
+                 "python3 -m patrol_global_localization.build_map_db "
+                 f"/project/patrol_data/maps/.staging_{map_id}_{os.getpid()}/map.npy "
+                 f"/project/patrol_data/maps/.staging_{map_id}_{os.getpid()}/trajectory.json"],
+                cwd=PROJECT, capture_output=True, text=True, timeout=600)
+            db_file = staging / "db.npz"
+            if db_run.returncode == 0 and db_file.is_file():
+                try:
+                    db = np.load(db_file)
+                    localization_ready = len(db["poses"]) >= 3 and db["descriptors"].shape[0] >= 3
+                except (OSError, ValueError, KeyError):
+                    localization_ready = False
+            if not localization_ready:
+                response["db_error"] = (db_run.stderr or db_run.stdout or "关键帧数据库生成失败")[-300:]
+        metadata = {
+            "map_id": map_id,
+            "frame": "map_level",
+            "pcd": "map.pcd",
+            "numpy_map": "map.npy" if (staging / "map.npy").is_file() else None,
+            "database": "db.npz" if (staging / "db.npz").is_file() else None,
+            "trajectory": "trajectory.json" if trajectory_ok else None,
+            "nav_map": "map.yaml" if nav_ok else None,
+            "lidar_extrinsic_version": "mid360_mount_v1",
+            "session_id": session_id,
+            "points": int(response.get("points", 0)),
+            "created_at": time.time(),
+            "mapping_available": True,
+            "localization_ready": localization_ready,
+        }
+        write_json(staging / "metadata.json", metadata)
+        # Atomic finalize: the package directory appears complete or not at all.
+        final = DATA / "maps" / map_id
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(staging, final)
+        # Bind checkpoints created during this session to the map.
+        points_list = read_json(CHECKPOINTS_FILE, [])
+        changed = False
+        for point in points_list:
+            if session_id and point.get("session_id") == session_id:
+                point["map_name"] = map_id
+                changed = True
+        if changed:
+            write_json(CHECKPOINTS_FILE, points_list)
+        write_json(ACTIVE_MAP_FILE, {"name": map_id, "updated_at": time.time()})
+        response["map_id"] = map_id
+        response["localization_ready"] = localization_ready
+        response["session_id"] = session_id
+        return response
     raise RuntimeError("等待三维地图保存超时")
 
 
@@ -494,43 +548,88 @@ def latest_nav_map():
 
 def map_inventory():
     active = read_json(ACTIVE_MAP_FILE, {}).get("name")
-    if not active:
-        candidates = sorted((DATA / "maps").glob("*.yaml"), key=lambda path: path.stat().st_mtime, reverse=True)
-        active = candidates[0].stem if candidates else None
     result = []
+    for meta_path in sorted((DATA / "maps").glob("*/metadata.json"),
+                            key=lambda p: p.stat().st_mtime, reverse=True):
+        map_id = meta_path.parent.name
+        meta = read_json(meta_path, {})
+        pcd = meta_path.parent / "map.pcd"
+        session_id = read_json(MAPPING_SESSION_FILE, {}).get("id")
+        result.append({
+            "name": map_id, "pcd": "map.pcd",
+            "points": meta.get("points", 0),
+            "bytes": pcd.stat().st_size if pcd.is_file() else 0,
+            "modified_at": meta_path.stat().st_mtime,
+            "nav_ready": (meta_path.parent / "map.yaml").is_file(),
+            "localization_ready": bool(meta.get("localization_ready")),
+            "active": map_id == active,
+            "session_id": meta.get("session_id"),
+            "current_session": bool(session_id and meta.get("session_id") == session_id),
+            "legacy": False,
+        })
     for pcd in sorted((DATA / "maps").glob("*.pcd"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if pcd.stem in {item["name"] for item in result}:
+            continue
         points = None
         try:
             with open(pcd, "rb") as handle:
                 for _ in range(40):
                     line = handle.readline().decode("ascii", "ignore").strip()
-                    if line.startswith("POINTS "): points = int(line.split()[1])
-                    if line.startswith("DATA "): break
+                    if line.startswith("POINTS "):
+                        points = int(line.split()[1])
+                    if line.startswith("DATA "):
+                        break
         except (OSError, ValueError):
             pass
         meta = read_json(pcd.with_suffix(".meta.json"), {})
-        current_session = read_json(MAPPING_SESSION_FILE, {}).get("id")
+        session_id = read_json(MAPPING_SESSION_FILE, {}).get("id")
         result.append({"name": pcd.stem, "pcd": pcd.name, "points": points,
                        "bytes": pcd.stat().st_size, "modified_at": pcd.stat().st_mtime,
-                       "nav_ready": pcd.with_suffix(".yaml").is_file(), "active": pcd.stem == active,
+                       "nav_ready": pcd.with_suffix(".yaml").is_file(),
+                       "localization_ready": False,
+                       "active": pcd.stem == active,
                        "session_id": meta.get("session_id"),
-                       "current_session": bool(current_session and meta.get("session_id") == current_session)})
+                       "current_session": bool(session_id and meta.get("session_id") == session_id),
+                       "legacy": True})
     return result
 
 
 def select_map(name):
     safe = Path(str(name)).stem
-    target = DATA / "maps" / (safe + ".pcd")
-    if not target.is_file() or target.parent != (DATA / "maps"):
+    packaged = DATA / "maps" / safe / "map.pcd"
+    legacy = DATA / "maps" / (safe + ".pcd")
+    if packaged.is_file():
+        meta = read_json(DATA / "maps" / safe / "metadata.json", {})
+        if not meta.get("mapping_available", True):
+            raise ValueError("该地图数据不完整，不能激活")
+    elif legacy.is_file():
+        if not legacy.with_suffix(".yaml").is_file():
+            raise ValueError("该PCD尚未生成导航层")
+    else:
         raise ValueError("三维地图不存在")
-    if not target.with_suffix(".yaml").is_file():
-        raise ValueError("该PCD尚未生成导航层")
     write_json(ACTIVE_MAP_FILE, {"name": safe, "updated_at": time.time()})
     return {"ok": True, "name": safe}
 
 
 def load_pcd_cloud(name):
     safe = Path(str(name)).stem
+    # Packaged maps: load the NumPy twin directly (exact float32, no parser).
+    npy = DATA / "maps" / safe / "map.npy"
+    if npy.is_file():
+        meta = read_json(DATA / "maps" / safe / "metadata.json", {})
+        points = np.load(npy, mmap_mode="r")
+        available = int(points.shape[0])
+        stride = max(1, math.ceil(available / 24000))
+        selected_array = np.asarray(points[::stride], dtype=np.float64)
+        low = [float(v) for v in selected_array.min(axis=0)]
+        high = [float(v) for v in selected_array.max(axis=0)]
+        selected = [round(float(v), 3) for v in selected_array.reshape(-1)]
+        if len(selected) > 72000:
+            selected = selected[:72000]
+        return {"available": bool(len(selected)), "frame": "map_level",
+                "map_name": safe, "total_points": available,
+                "shown_points": len(selected) // 3, "bounds": [low, high],
+                "points": selected, "updated_at": npy.stat().st_mtime}
     target = DATA / "maps" / (safe + ".pcd")
     if not target.is_file() or target.parent != (DATA / "maps"):
         raise ValueError("三维地图不存在")
@@ -898,7 +997,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not name:
                     raise ValueError("缺少地图名称")
                 target = DATA / "maps" / (name + ".pcd")
-                if not target.is_file() or target.parent != (DATA / "maps"):
+                package_dir = DATA / "maps" / name
+                if not target.is_file() and not package_dir.is_dir():
                     raise ValueError("三维地图不存在")
                 if service_status().get("navigation", {}).get("running") and \
                         read_json(ACTIVE_MAP_FILE, {}).get("name") == name:
@@ -908,7 +1008,11 @@ class Handler(BaseHTTPRequestHandler):
                         active_meta.get("session_id") == read_json(MAPPING_SESSION_FILE, {}).get("id"):
                     raise ValueError("该地图对应正在进行的建图会话，请先停止建图再删除")
                 removed_files = 0
-                for suffix in (".pcd", ".meta.json", ".pgm", ".yaml", ".png"):
+                package_dir = DATA / "maps" / name
+                if package_dir.is_dir():
+                    shutil.rmtree(package_dir)
+                    removed_files += 1
+                for suffix in (".pcd", ".npy", ".meta.json", ".pgm", ".yaml", ".png"):
                     candidate = DATA / "maps" / (name + suffix)
                     if candidate.is_file():
                         candidate.unlink()
