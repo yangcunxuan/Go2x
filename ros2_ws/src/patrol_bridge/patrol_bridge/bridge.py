@@ -11,7 +11,8 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
-from tf2_ros import TransformBroadcaster
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 try:
     from nav2_msgs.action import NavigateToPose
 except ImportError:
@@ -69,6 +70,12 @@ class Bridge(Node):
         self.cloud_window_seconds=float(os.environ.get('GO2_CLOUD_WINDOW','0.8'))
         self.cloud_batches=deque(); self.latest_odom_pose=None
         self.tf_broadcaster=TransformBroadcaster(self)
+        # Plan A: in localization mode the localization_manager publishes the
+        # dynamic map_level <- camera_init TF; in mapping mode the static
+        # leveling TF covers it. The web pose/cloud follow the live TF with
+        # the env-based level transform as last resort.
+        self.tf_buffer=Buffer()
+        self.tf_listener=TransformListener(self.tf_buffer,self)
         self.create_subscription(OccupancyGrid,self.get_parameter('map_topic').value,self.on_map,1)
         self.cloud_map_topic=os.environ.get('CLOUD_MAP_TOPIC','/Laser_map')
         self.cloud_map_max_points=max(2000,int(os.environ.get('CLOUD_MAP_MAX_POINTS','24000')))
@@ -120,10 +127,28 @@ class Bridge(Node):
         self.recovery_last_write=0.0;self.recovery_last_cloud_time=0.0
         self.create_timer(.25,self.tick); self.create_timer(.25,self.cloud_save_tick); self.create_timer(5.0,self.recovery_tick); self.create_timer(.05,self.teleop_tick); self.create_timer(.05,self.nav_watchdog); self.create_timer(.5,self.write_state)
         self.get_logger().info('Patrol bridge ready, runtime='+str(RUNTIME))
+    def map_level_transform(self):
+        """4x4 map_level <- camera_init. Live TF first (localization mode),
+        env/static level transform as last resort (mapping mode before its
+        static TF is up, or legacy deployments)."""
+        try:
+            tf=self.tf_buffer.lookup_transform('map_level','camera_init',Time())
+            tr=tf.transform
+            matrix=np.eye(4,dtype=np.float64)
+            matrix[:3,:3]=rotation_from_q(tr.rotation)
+            matrix[:3,3]=[tr.translation.x,tr.translation.y,tr.translation.z]
+            return matrix
+        except Exception:
+            matrix=np.eye(4,dtype=np.float64)
+            matrix[:3,:3]=self.cloud_level_rotation
+            matrix[:3,3]=self.cloud_level_translation
+            return matrix
+
     def on_odom(self,msg):
         p=msg.pose.pose.position; q=msg.pose.pose.orientation
         raw_roll,raw_pitch,raw_yaw=rpy_from_q(q)
-        level_position=self.cloud_level_rotation@np.array([p.x,p.y,p.z],dtype=np.float32)+self.cloud_level_translation
+        level_position=self.map_level_transform()@np.array([p.x,p.y,p.z,1.0],dtype=np.float64)
+        level_position=level_position[:3]
         roll,pitch,yaw=rpy_from_rotation(self.cloud_level_rotation@rotation_from_q(q))
         display_yaw=math.atan2(math.sin(yaw+self.robot_yaw_offset),math.cos(yaw+self.robot_yaw_offset))
         sample_time=time.time()
@@ -230,7 +255,8 @@ class Bridge(Node):
         except (ValueError,BufferError):return
         if not len(points):return
         if len(points)>4000:points=points[::math.ceil(len(points)/4000)]
-        points=points@self.cloud_level_rotation.T+self.cloud_level_translation
+        points=(points @ self.map_level_transform()[:3,:3].T
+                + self.map_level_transform()[:3,3])
         now=time.monotonic()
         self.scan_window.append((now,points))
         while self.scan_window and now-self.scan_window[0][0]>self.scan_window_seconds:
@@ -300,9 +326,11 @@ class Bridge(Node):
             # NumPy twin for the localization stack: exact float32 dump of the
             # same map_level cloud, loaded with np.load(..., mmap_mode="r").
             npy=target.with_suffix('.npy')
-            npy_tmp=Path(str(npy)+'.tmp')
-            np.save(npy_tmp,points)
-            os.replace(npy_tmp,npy)
+            # np.save appends ".npy" to any filename that does not end with
+            # it — pass an open file handle so the .tmp name is respected.
+            with open(str(npy)+'.tmp','wb') as handle:
+                np.save(handle,np.asarray(points,dtype='<f4'))
+            os.replace(str(npy)+'.tmp',npy)
             response.update(ok=True,name=name,pcd=str(target),npy=str(npy),points=int(len(points)),bytes=target.stat().st_size)
         except Exception as exc:response['error']=str(exc)
         atomic_json(RUNTIME/'cloud_save_response.json',response)

@@ -7,7 +7,20 @@ non-LOCALIZED or mismatched input blocks motion.
 import math
 import time
 
+import numpy as np
+
 STATE_FRESH_SEC = 2.0
+
+
+def quat_matrix(qx, qy, qz, qw):
+    """Unit quaternion (x, y, z, w) -> 3x3 rotation matrix."""
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
 
 
 def angle_diff(a, b):

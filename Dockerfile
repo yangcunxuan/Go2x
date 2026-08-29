@@ -33,13 +33,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Global localization stack (Plan A): small_gicp provides multithreaded
-# GICP/VGICP refinement for the Scan Context -> GICP relocalization chain.
-# Primary install from the aliyun PyPI mirror (consistent with apt above);
-# a plain PyPI attempt is the fallback and failure is tolerated so image
-# builds never break on network flakiness — the localization manager
-# falls back to open3d if small_gicp is absent at runtime.
-RUN pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ small_gicp     || pip3 install --no-cache-dir small_gicp     || echo "WARNING: small_gicp unavailable; localization falls back to open3d"
-
+# GICP/VGICP refinement for the Scan Context -> GICP chain. It is a
+# MANDATORY dependency (the localization manager has no fallback backend):
+# if both indexes fail, the image build fails, matching runtime needs.
+RUN (pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ small_gicp \
+     || pip3 install --no-cache-dir small_gicp)
 
 # Livox SDK2 is vendored from pinned commit 08f523c930b2f0ba1e98a6afaa8d7476bf479908
 # so image builds do not depend on a live GitHub connection.

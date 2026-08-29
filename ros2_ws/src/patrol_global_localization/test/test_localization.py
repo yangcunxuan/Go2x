@@ -74,11 +74,12 @@ def test_descriptor_yaw_shift_sign():
     sc90 = make_descriptor_height(rotated, sensor_z=0.0)
     dist, shift = distance(sc0, sc90)
     sector_angle = 2 * math.pi / sc0.shape[1]
+    # Convention pinned by this test: rotating the SCENE by +theta shifts
+    # the descriptor columns by -theta/sector (measured empirically), so
+    # consumers must apply yaw_fix = -shift * sector_angle.
     recovered = (shift * sector_angle) % (2 * math.pi)
-    # Convention pinned by this test: rotating the scene by +90 deg maps to a
-    # shift of either +90 or -90 (mod 2pi); whichever it is, it is fixed.
-    assert min(abs(recovered - math.pi / 2), abs(recovered - 3 * math.pi / 2)) \
-        < sector_angle * 1.5, (recovered, dist)
+    assert abs(recovered - 2 * math.pi + math.pi / 2) < sector_angle * 1.5, \
+        (recovered, dist)
 
 
 def test_search_entry_contract_without_ring_key():

@@ -341,7 +341,10 @@ def save_cloud_map(name):
                 changed = True
         if changed:
             write_json(CHECKPOINTS_FILE, points_list)
-        write_json(ACTIVE_MAP_FILE, {"name": map_id, "updated_at": time.time()})
+        # Only a localization-ready map becomes the ACTIVE navigation map;
+        # an incomplete package stays viewable but cannot be navigated to.
+        if localization_ready:
+            write_json(ACTIVE_MAP_FILE, {"name": map_id, "updated_at": time.time()})
         response["map_id"] = map_id
         response["localization_ready"] = localization_ready
         response["session_id"] = session_id
@@ -537,11 +540,20 @@ def set_nav_motion(enabled, reason=""):
 
 
 def latest_nav_map():
+    """2D nav grid (YAML) of the active map. Package layout first
+    (maps/<map_id>/map.yaml), then the legacy flat layout."""
     active = read_json(ACTIVE_MAP_FILE, {}).get("name")
     if active:
-        selected = DATA / "maps" / (Path(active).stem + ".yaml")
-        if selected.is_file():
-            return selected
+        packaged = DATA / "maps" / active / "map.yaml"
+        if packaged.is_file():
+            return packaged
+        legacy = DATA / "maps" / (Path(active).stem + ".yaml")
+        if legacy.is_file():
+            return legacy
+    maps = sorted((DATA / "maps").glob("*/map.yaml"),
+                  key=lambda path: path.stat().st_mtime, reverse=True)
+    if maps:
+        return maps[0]
     maps = sorted((DATA / "maps").glob("*.yaml"), key=lambda path: path.stat().st_mtime, reverse=True)
     return maps[0] if maps else None
 
@@ -600,8 +612,8 @@ def select_map(name):
     legacy = DATA / "maps" / (safe + ".pcd")
     if packaged.is_file():
         meta = read_json(DATA / "maps" / safe / "metadata.json", {})
-        if not meta.get("mapping_available", True):
-            raise ValueError("该地图数据不完整，不能激活")
+        if not meta.get("localization_ready", False):
+            raise ValueError("该地图缺少重定位数据库，不能激活为导航地图")
     elif legacy.is_file():
         if not legacy.with_suffix(".yaml").is_file():
             raise ValueError("该PCD尚未生成导航层")
@@ -786,6 +798,20 @@ def execute_steps(run_id, task):
                 # robot pose (map_level, same frame as the checkpoint) within
                 # arrive_radius for 4 consecutive samples, else the step times
                 # out and motion is cut. Never report success on timeout.
+                # Same hard gate as the manual goal endpoint (P0 audit #5):
+                # LOCALIZED + map binding, or the task must not move the dog.
+                loc = read_json(RUNTIME / "localization_state.json", {})
+                active = latest_nav_map()
+                active_map_id = active.parent.name if (active and active.parent.name != "maps") \
+                    else (active.stem if active else None)
+                if time.time() - float(loc.get("updated_at", 0)) > 2.0 \
+                        or loc.get("state") != "LOCALIZED" \
+                        or not loc.get("ok_for_navigation"):
+                    raise RuntimeError("全局定位未就绪（未LOCALIZED），任务无法导航")
+                if loc.get("map_id") != active_map_id:
+                    raise RuntimeError("定位地图与活动地图不一致，任务无法导航")
+                if checkpoint.get("map_name") not in (None, active_map_id):
+                    raise RuntimeError(f"巡查点属于地图{checkpoint.get('map_name')}，与活动地图不一致")
                 goal = issue_goal(checkpoint)
                 set_nav_motion(True, "任务导航：" + checkpoint["name"])
                 deadline = time.time() + min(600, max(10, int(step.get("timeout", 120))))

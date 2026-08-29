@@ -8,8 +8,8 @@ search, which gives yaw-invariance up to the sector resolution.
 """
 import numpy as np
 
-NUM_RINGS = 80
-NUM_SECTORS = 20
+NUM_RINGS = 20
+NUM_SECTORS = 60
 MAX_RANGE = 20.0
 
 
@@ -86,21 +86,23 @@ def distance(sc1, sc2):
 
 
 def search(database, query_sc, topk=5):
-    """database: list of dicts with 'sc' and index metadata. Returns the top-k
-    (entry, distance, shift) candidates ranked by ring-key then exact distance."""
+    """database: list of dicts with 'sc' and index metadata. Returns the
+    top-k (entry, distance, shift) candidates.
+
+    Coarse pass ranks by ring-key L2 distance (a column shift does not change
+    ring means, so no circular correlation is needed); the fine pass does the
+    exact 60-sector shift search only for the top-20."""
     if not len(database):
         return []
     query_ring = ring_key(query_sc)
-    # Coarse pass: circular cross-correlation of ring keys via FFT.
     coarse = []
     for entry in database:
         rk = entry.get('ring_key')
         if rk is None:  # defensive: callers may pass bare descriptors
             rk = ring_key(entry['sc'])
             entry['ring_key'] = rk
-        corr = np.fft.irfft(np.fft.rfft(query_ring) * np.conj(np.fft.rfft(rk)), len(rk))
-        coarse.append(float(corr.max()))
-    order = np.argsort(coarse)[::-1][:max(topk * 4, 20)]
+        coarse.append(float(np.linalg.norm(query_ring.astype(np.float32) - rk.astype(np.float32))))
+    order = np.argsort(coarse)[:max(topk * 4, 20)]
     results = []
     for i in order:
         d, shift = distance(query_sc, database[i]['sc'])

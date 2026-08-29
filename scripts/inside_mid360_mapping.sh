@@ -20,11 +20,10 @@ if ros2 topic list 2>/dev/null | grep -Fxq /Odometry; then
   exit 3
 fi
 
-ALIGNMENT_FILE=/project/runtime/localization_alignment.json
-read -r MAP_LEVEL_X MAP_LEVEL_Y MAP_LEVEL_Z MAP_LEVEL_YAW < <(python3 -c 'import json,sys; p=sys.argv[1];
-try: d=json.load(open(p))
-except Exception: d={}
-print(float(d.get("x",0)),float(d.get("y",0)),float(d.get("z",0)),float(d.get("yaw",0)))' "$ALIGNMENT_FILE")
+# map_level for a NEW map is anchored at the boot pose with only the fixed
+# mechanical mount angles (P0 audit: stale alignment offsets must not leak
+# into new maps). localization_alignment.json is legacy/debug only.
+MAP_LEVEL_X=0 MAP_LEVEL_Y=0 MAP_LEVEL_Z=0 MAP_LEVEL_YAW=0
 export MAP_LEVEL_X MAP_LEVEL_Y MAP_LEVEL_Z MAP_LEVEL_YAW
 PIDS=(); NAMES=(); cleanup(){ kill -INT "${PIDS[@]}" 2>/dev/null || true; }; trap cleanup EXIT INT TERM
 

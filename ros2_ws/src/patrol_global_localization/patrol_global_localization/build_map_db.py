@@ -23,7 +23,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from patrol_global_localization.scan_context import make_descriptor_height  # noqa: E402
+from patrol_global_localization.scan_context import (  # noqa: E402
+    NUM_RINGS, NUM_SECTORS, make_descriptor_height)
 
 VOXEL = 0.15
 CROP_RADIUS = 20.0
@@ -84,7 +85,7 @@ def main():
     out = npy_path.parent / 'db.npz'
     np.savez_compressed(out, poses=np.array(poses, dtype=np.float32),
                         descriptors=np.array(descriptors, dtype=np.uint8),
-                        sc_shape=np.array([80, 20]))
+                        sc_shape=np.array([NUM_RINGS, NUM_SECTORS]))
     print(f'db built: {out} keyframes={len(poses)}')
 
 

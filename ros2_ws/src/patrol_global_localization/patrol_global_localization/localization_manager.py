@@ -54,6 +54,7 @@ from tf2_ros import TransformBroadcaster
 RUNTIME = Path(os.environ.get('PATROL_RUNTIME', '/project/runtime'))
 DATA = Path(os.environ.get('PATROL_DATA', '/project/patrol_data'))
 
+WINDOW_VOXEL = 0.2
 WINDOW_SEC = 4.0
 WINDOW_MIN_POINTS = 2000
 COARSE_VOXEL = 0.5
@@ -79,8 +80,8 @@ CLUSTER_YAW = math.radians(10.0)
 
 
 from patrol_global_localization.navigation_gate import (
-    angle_diff, cluster_hypotheses, track_update, uniqueness_decision,
-    verify_consistent)
+    angle_diff, cluster_hypotheses, quat_matrix, track_update,
+    uniqueness_decision, verify_consistent)
 
 
 def yaw_of(t):
@@ -88,23 +89,7 @@ def yaw_of(t):
 
 
 def quat_matrix_from_msg(q):
-    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) or 1.0
-    qx, qy, qz, qw = q.x / n, q.y / n, q.z / n, q.w / n
-    return np.array([
-        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
-        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
-    ], dtype=np.float64)
-
-
-def quat_matrix(qx, qy, qz, qw):
-    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
-    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
-    return np.array([
-        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
-        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
-    ], dtype=np.float64)
+    return quat_matrix(q.x, q.y, q.z, q.w)
 
 
 def voxel_downsample(points, voxel):
@@ -118,36 +103,41 @@ def voxel_downsample(points, voxel):
 def evaluate_registration(target, transformed, cell=0.3):
     """Self-computed quality metrics (small_gicp version-independent).
 
-    fitness: fraction of transformed source points landing within `cell` of
-    a target point (voxel-hash nearest-cell approximation).
-    rmse: RMS of the distance from each transformed source point to the
-    center of its nearest occupied target cell, over matched points.
+    fitness: fraction of transformed source points whose containing voxel is
+    occupied by the target.
+    rmse: RMS distance from transformed source points to the nearest occupied
+    target voxel center, evaluated only over the 27 neighboring cells of each
+    point (O(K x 27), no full-map scan).
     """
     if not len(target) or not len(transformed):
         return 0.0, 1e3
     t_keys = np.floor(target[:, :3] / cell).astype(np.int64)
     s_keys = np.floor(transformed[:, :3] / cell).astype(np.int64)
-    t_map = {}
-    for key in map(tuple, t_keys):
-        t_map[key] = True
-    s_unique, counts = np.unique(s_keys, axis=0, return_counts=True)
+    occupied = {tuple(k): None for k in np.unique(t_keys, axis=0)}
+    if not occupied:
+        return 0.0, 1e3
+    offsets = [(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1)
+               for k in (-1, 0, 1)]
     hits = 0
-    for key, count in zip(map(tuple, s_unique), counts):
-        if key in t_map:
-            hits += count
+    sq = []
+    sample_stride = max(1, len(transformed) // 2000)
+    for idx in range(0, len(transformed), sample_stride):
+        p = transformed[idx]
+        key = tuple(s_keys[idx])
+        if key in occupied:
+            hits += 1
+        best2 = None
+        for off in offsets:
+            nk = (key[0] + off[0], key[1] + off[1], key[2] + off[2])
+            if nk in occupied:
+                center = (np.array(nk) + 0.5) * cell
+                d2 = float(np.sum((center - p) ** 2))
+                if best2 is None or d2 < best2:
+                    best2 = d2
+        if best2 is not None and best2 <= 1.0:
+            sq.append(best2)
     fitness = hits / len(transformed) if len(transformed) else 0.0
-    # RMSE via nearest occupied-cell center distance for a sample of points
-    if t_map and len(transformed):
-        sample = transformed[::max(1, len(transformed) // 2000)]
-        t_arr = np.array(list(t_map.keys()), dtype=np.float64) * cell + cell / 2
-        sq = []
-        for p in sample:
-            d2 = np.min(np.sum((t_arr - p) ** 2, axis=1))
-            if d2 <= 0.5 ** 2 * 4:  # within 1 m
-                sq.append(d2)
-        rmse = math.sqrt(sum(sq) / len(sq)) if sq else 1e3
-    else:
-        rmse = 1e3
+    rmse = math.sqrt(sum(sq) / len(sq)) if sq else 1e3
     return fitness, rmse
 
 
@@ -185,6 +175,7 @@ class LocalizationManager(Node):
     def __init__(self):
         super().__init__('localization_manager')
         self.boot_id = uuid.uuid4().hex
+        self.dbs = {}
         self.sequence = 0
         self.state = 'UNINITIALIZED'
         self.state_message = '启动'
@@ -328,9 +319,11 @@ class LocalizationManager(Node):
             t_map_sensor_kf = np.eye(4)
             t_map_sensor_kf[:3, :3] = quat_matrix(*pose[3:7])
             t_map_sensor_kf[:3, 3] = pose[:3]
-            # yaw shift from the sector match; sign verified by the
-            # descriptor_yaw_shift_sign unit test
-            yaw_fix = cand['shift'] * sector_angle
+            # yaw shift from the sector match. Sign pinned by the
+            # descriptor_yaw_shift_sign unit test: a scene rotated by +delta
+            # in the current sensor frame yields shift = -delta/sector, so
+            # the init correction is the NEGATIVE of the reported shift.
+            yaw_fix = -cand['shift'] * sector_angle
             init = (t_map_sensor_kf
                     @ transform_yaw(yaw_fix)
                     @ np.linalg.inv(self.t_cam_sensor))
@@ -410,6 +403,10 @@ class LocalizationManager(Node):
             self.t_map_cam = None
         elif self.degraded_count >= 3:
             self.set_state('DEGRADED', '匹配质量下降')
+        elif self.state == 'DEGRADED':
+            # Quality recovered: navigation may resume (gate re-opens with
+            # LOCALIZED). Movement stays blocked until this transition.
+            self.set_state('LOCALIZED', '匹配质量恢复')
 
     def align_one(self, map_name, window, init_t):
         pts = self.dbs.get(map_name, {}).get('points')
