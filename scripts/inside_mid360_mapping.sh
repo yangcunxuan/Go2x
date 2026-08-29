@@ -49,10 +49,19 @@ ros2 run tf2_ros static_transform_publisher \
 # pointcloud_to_laserscan or slam_toolbox. Those 2-D nodes belong to the
 # navigation preparation path, not the MID360 FAST-LIO mapping session.
 # Record the mapping trajectory for the global-localization database (Plan A).
+# P0 audit: the session id must be sliced INSIDE python (print(...)[:8]
+# slices the None return value) and must be EXPORTED so keyframe_saver
+# inherits it — otherwise it writes trajectory_unknown.json and the DB can
+# never be built.
 MAPPING_SESSION_ID=$(python3 -c 'import json
-try: print(json.load(open("/project/runtime/mapping_session.json")).get("id","unknown"))[:8]
-except Exception: print("unknown")')
-PYTHONPATH=/project/ros2_ws/src/patrol_global_localization python3 -m patrol_global_localization.keyframe_saver >> /project/runtime/logs/keyframe_saver.log 2>&1 & PIDS+=($!); NAMES+=(keyframe_saver)
+try:
+    print(str(json.load(open("/project/runtime/mapping_session.json")).get("id", "unknown"))[:8])
+except Exception:
+    print("unknown")')
+export MAPPING_SESSION_ID
+MAPPING_SESSION_ID="$MAPPING_SESSION_ID" \
+  PYTHONPATH=/project/ros2_ws/src/patrol_global_localization \
+  python3 -m patrol_global_localization.keyframe_saver >> /project/runtime/logs/keyframe_saver.log 2>&1 & PIDS+=($!); NAMES+=(keyframe_saver)
 CLOUD_MAP_TOPIC=/__disabled ODOM_TOPIC=/Odometry ros2 run patrol_bridge bridge > /project/runtime/logs/patrol_bridge.log 2>&1 & PIDS+=($!); NAMES+=(patrol_bridge)
 mkdir -p /project/runtime/cloud_bridge
 PATROL_RUNTIME=/project/runtime/cloud_bridge ODOM_TOPIC=/__disabled \

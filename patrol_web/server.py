@@ -327,11 +327,22 @@ def save_cloud_map(name):
             "localization_ready": localization_ready,
         }
         write_json(staging / "metadata.json", metadata)
-        # Atomic finalize: the package directory appears complete or not at all.
+        # Atomic finalize: the package directory appears complete or not at
+        # all. Overwrites move the old dir aside first (a crash between
+        # rmtree and replace would otherwise destroy the previous map).
         final = DATA / "maps" / map_id
+        backup = None
         if final.exists():
-            shutil.rmtree(final)
-        os.replace(staging, final)
+            backup = DATA / "maps" / f".old_{map_id}_{int(time.time())}"
+            os.replace(final, backup)
+        try:
+            os.replace(staging, final)
+        except OSError:
+            if backup is not None:
+                os.replace(backup, final)  # roll back
+            raise
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
         # Bind checkpoints created during this session to the map.
         points_list = read_json(CHECKPOINTS_FILE, [])
         changed = False
@@ -567,6 +578,8 @@ def map_inventory():
     for meta_path in sorted((DATA / "maps").glob("*/metadata.json"),
                             key=lambda p: p.stat().st_mtime, reverse=True):
         map_id = meta_path.parent.name
+        if map_id.startswith("."):
+            continue  # staging / backup dirs
         meta = read_json(meta_path, {})
         pcd = meta_path.parent / "map.pcd"
         session_id = read_json(MAPPING_SESSION_FILE, {}).get("id")
