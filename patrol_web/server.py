@@ -62,7 +62,7 @@ LOCK = threading.RLock()
 SERVICES = {}
 SERVICE_SCRIPTS = {
     "mapping": "run_mid360_nav_mapping_stack.sh",
-    "navigation": "run_planner_stack.sh",
+    "navigation": "run_navigation_stack_v2.sh",
     "go2_state": "run_go2_state_bridge.sh",
 }
 TASK_RUN = {"id": None, "task_id": None, "state": "idle", "step": 0, "message": "", "started_at": None}
@@ -923,29 +923,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(200, {"ok": True, "removed_files": removed_files,
                                          "removed_checkpoints": removed_points})
             elif path == "/api/navigation/start":
-                state = robot_state()
-                if not state.get("online") or not state.get("cloud_map_online"):
-                    raise ValueError("实时定位或MID360点云未在线，禁止启动导航")
-                session = mapping_session()
-                active = latest_nav_map()
-                active_meta = read_json(active.with_suffix(".meta.json"), {}) if active else {}
-                map_mode = bool(active and active_meta.get("session_id") == session.get("id"))
-                if map_mode:
-                    # Saved-map mode: the map belongs to the live session and
-                    # the dog must stand inside its navigable area.
-                    prepare_navigation_map(state["pose"])
-                # A stale active map from an earlier session no longer blocks
-                # navigation: fall through to live-session mode instead.
-                # Live-session mode (no session-matched map): navigate on the
-                # rolling live cloud; points picked this session (__live__)
-                # are the targets. The old hard requirement of a saved map
-                # blocked the separated mapping/navigation service layout.
+                # Dual-mode perception: mapping owns the lidar with
+                # map_en=true; navigation needs localization mode with the
+                # global localizer. They are mutually exclusive. Reachability
+                # checks belong to the GOAL layer (after LOCALIZED), not here:
+                # before localization succeeds the dog has no valid
+                # map_level pose at all.
+                if service_status().get("mapping", {}).get("running"):
+                    raise ValueError("三维建图运行中，请先停止建图再启动导航")
                 teleop_disarm("自主导航启动，手动控制已锁定")
-                set_nav_motion(False, "导航服务启动，等待用户确认目标")
-                # A target clicked while only mapping must never be executed
-                # automatically by a newly started navigation process.
+                set_nav_motion(False, "导航服务启动，等待定位与用户确认目标")
                 GOAL_FILE.unlink(missing_ok=True)
-                start_service("navigation", "run_planner_stack.sh")
+                start_service("navigation", "run_navigation_stack_v2.sh")
                 self.json_response(200, require_service_stays_running("navigation", 4.0))
             elif path == "/api/navigation/stop":
                 set_nav_motion(False, "用户停止自主导航")
