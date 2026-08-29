@@ -31,29 +31,6 @@ LEVEL_ROLL = -0.030788
 LEVEL_PITCH = 0.621767
 
 
-def static_transform():
-    """Fallback: fixed mount angles + session offset from the alignment file."""
-    try:
-        alignment = json.loads((RUN / 'localization_alignment.json').read_text(
-            encoding='utf-8'))
-    except (OSError, ValueError):
-        alignment = {}
-    yaw = float(alignment.get('yaw', 0))
-    cr, sr = math.cos(LEVEL_ROLL), math.sin(LEVEL_ROLL)
-    cp, sp = math.cos(LEVEL_PITCH), math.sin(LEVEL_PITCH)
-    base = np.array([[cp, 0.0, sp],
-                     [sr * sp, cr, -sr * cp],
-                     [-cr * sp, sr, cr * cp]], dtype=np.float64)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    yrot = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
-    rot = yrot @ base
-    trans = np.array([float(alignment.get('x', 0)), float(alignment.get('y', 0)),
-                      float(alignment.get('z', 0))])
-    matrix = np.eye(4)
-    matrix[:3, :3], matrix[:3, 3] = rot, trans
-    return matrix
-
-
 def quat_to_matrix(q):
     x, y, z, w = q.x, q.y, q.z, q.w
     return np.array([
@@ -67,14 +44,11 @@ def main():
     rclpy.init()
     node = Node('goal_relay')
     pub = node.create_publisher(PointStamped, '/goal_point', 5)
-    tf_buffer = None
-    try:
-        from tf2_ros import Buffer, TransformListener
-        tf_buffer = Buffer()
-        TransformListener(tf_buffer, node)
-    except Exception as exc:  # tf2 missing should never happen, be safe
-        node.get_logger().warning(f'TF 不可用，退回静态变换: {exc}')
-    fallback = static_transform()
+    from tf2_ros import Buffer, TransformListener
+    tf_buffer = Buffer()
+    # Keep the listener reference alive: an unreferenced TransformListener is
+    # garbage-collected and its TF cache never fills.
+    tf_listener = TransformListener(tf_buffer, node)
     last_id = None
     goal = None        # raw map_level coordinates, converted on every publish
     last_publish = 0.0
@@ -87,19 +61,15 @@ def main():
     node.get_logger().info('goal relay ready (map_level -> camera_init, TF 优先)')
 
     def current_matrix():
-        """Latest map_level<-camera_init as 4x4; live TF first, static fallback."""
-        if tf_buffer is not None:
-            try:
-                m = tf_buffer.lookup_transform('map_level', 'camera_init', Time())
-                tr = m.transform
-                matrix = np.eye(4)
-                matrix[:3, :3] = quat_to_matrix(tr.rotation)
-                matrix[:3, 3] = [tr.translation.x, tr.translation.y,
-                                 tr.translation.z]
-                return matrix, True
-            except Exception:
-                pass
-        return fallback, False
+        """Latest map_level<-camera_init as 4x4 from live TF. No static
+        fallback: if TF is unavailable the goal is NOT published (P0 audit —
+        a guessed frame is worse than no goal)."""
+        m = tf_buffer.lookup_transform('map_level', 'camera_init', Time())
+        tr = m.transform
+        matrix = np.eye(4)
+        matrix[:3, :3] = quat_to_matrix(tr.rotation)
+        matrix[:3, 3] = [tr.translation.x, tr.translation.y, tr.translation.z]
+        return matrix
 
     while True:
         rclpy.spin_once(node, timeout_sec=0.05)
@@ -134,7 +104,10 @@ def main():
         now = time.monotonic()
         if goal and now - last_publish >= 0.5:
             last_publish = now
-            matrix, live = current_matrix()
+            try:
+                matrix = current_matrix()
+            except Exception:
+                continue  # TF not ready: pause goal publishing
             p = np.array([goal['x'], goal['y'], goal['z'], 1.0])
             c = np.linalg.inv(matrix) @ p
             m = PointStamped()
@@ -145,8 +118,7 @@ def main():
             if not transform_logged[0]:
                 transform_logged[0] = True
                 node.get_logger().info(
-                    f"camera_init=({c[0]:.2f},{c[1]:.2f},{c[2]:.2f}) "
-                    f"transform={'TF动态' if live else '静态兜底'}")
+                    f"camera_init=({c[0]:.2f},{c[1]:.2f},{c[2]:.2f}) [TF动态]")
         time.sleep(0.05)
 
 

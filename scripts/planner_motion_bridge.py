@@ -37,8 +37,10 @@ from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as NavPath
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
+from tf2_ros import Buffer, TransformListener
 
 ENABLE_FILE = Path(os.environ.get("NAV_ENABLE_FILE", "/project/runtime/nav_motion_enable.json"))
 GO2_STATE_FILE = Path(os.environ.get("GO2_STATE_FILE", "/project/runtime/go2_state.json"))
@@ -57,35 +59,6 @@ FRONT_HALF_ANGLE_DEG = float(os.environ.get("FRONT_HALF_ANGLE_DEG", "35.0"))
 # slightly lower threshold so real obstacles trip before the max.
 OBSTACLE_INTENSITY = float(os.environ.get("TERRAIN_OBSTACLE_INTENSITY", "0.36"))
 TERRAIN_MAX_AGE = float(os.environ.get("TERRAIN_MAX_AGE", "1.5"))
-# MID360 mount angles (constant) + per-session offset from
-# localization_alignment.json: the same map_level transform patrol_bridge
-# applies to clouds. Used to publish the vehicle-frame local path in the
-# map frame so the web can draw it on the 3D cloud.
-LEVEL_ROLL = -0.030788
-LEVEL_PITCH = 0.621767
-
-
-def load_level_transform():
-    try:
-        alignment = json.loads(Path(os.environ.get(
-            "GO2_ALIGNMENT_FILE", "/project/runtime/localization_alignment.json")
-        ).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        alignment = {}
-    yaw = float(alignment.get("yaw", 0))
-    cr, sr = math.cos(LEVEL_ROLL), math.sin(LEVEL_ROLL)
-    cp, sp = math.cos(LEVEL_PITCH), math.sin(LEVEL_PITCH)
-    base = np.array([[cp, 0.0, sp],
-                     [sr * sp, cr, -sr * cp],
-                     [-cr * sp, sr, cr * cp]])
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    yrot = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
-    rot = yrot @ base
-    trans = np.array([float(alignment.get("x", 0)), float(alignment.get("y", 0)),
-                      float(alignment.get("z", 0))])
-    return rot, trans
-
-
 def twist_fields(cloud, odom):
     """Return (front_min, left_min, right_min) obstacle distance in body frame.
 
@@ -157,7 +130,11 @@ class PlannerMotionBridge(Node):
         odom_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Odometry, "/Odometry", self.on_odom, odom_qos)
         PATH_FILE.unlink(missing_ok=True)
-        self.level_rot, self.level_trans = load_level_transform()
+        # Dynamic TF is the single source of truth (Plan A): route display is
+        # transformed map_level <- camera_init via the live TF published by
+        # the localization manager. No alignment-file fallback.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.last_command = 0.0
         self.front_min = math.inf
         self.left_min = math.inf
@@ -186,25 +163,27 @@ class PlannerMotionBridge(Node):
         # with the same level transform the cloud uses, so the web can draw
         # the route on the 3D map instead of offset from it.
         vehicle_frame = (message.header.frame_id or "") == "base_footprint"
-        ox = oy = oyaw = 0.0
-        if vehicle_frame and self.odom is not None:
-            opose = self.odom.pose.pose
-            ox, oy = opose.position.x, opose.position.y
-            q = opose.orientation
-            oyaw = math.atan2(2.0 * (q.z * q.w + q.x * q.y),
-                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        cy, sy = math.cos(oyaw), math.sin(oyaw)
         points = []
+        try:
+            m = tf_buffer_lookup(self.tf_buffer, "map_level", "camera_init")
+        except Exception:
+            m = None
+        if m is None:
+            # No live localization TF: publishing a route in a guessed frame
+            # would draw it in the wrong place — skip this cycle.
+            return
+        t_cam_vehicle = np.eye(4)
+        if self.odom is not None:
+            opose = self.odom.pose.pose
+            t_cam_vehicle[:3, :3] = quat_matrix_from_odom(opose.orientation)
+            t_cam_vehicle[:3, 3] = [opose.position.x, opose.position.y,
+                                    opose.position.z]
+        full = m @ t_cam_vehicle
         for p in poses[::stride]:
-            x = float(p.pose.position.x)
-            y = float(p.pose.position.y)
-            z = float(p.pose.position.z)
-            if vehicle_frame:
-                wx, wy = ox + cy * x - sy * y, oy + sy * x + cy * y
-            else:
-                wx, wy = x, y
-            mapped = self.level_rot @ np.array([wx, wy, z]) + self.level_trans
-            points.append([float(mapped[0]), float(mapped[1]), float(mapped[2])])
+            v = full @ np.array([float(p.pose.position.x), float(p.pose.position.y),
+                                 float(p.pose.position.z), 1.0])
+            points.append([round(float(v[0]), 3), round(float(v[1]), 3),
+                           round(float(v[2]), 3)])
         temporary = Path(f"{PATH_FILE}.{os.getpid()}.tmp")
         payload = {"available": bool(points), "frame": "map_level",
                    "updated_at": time.time(), "points": points}
@@ -220,21 +199,30 @@ class PlannerMotionBridge(Node):
         self.path_start_ok = bool(points)
 
     def localization_ready(self):
-        """Plan A hard gate: GO2 motion requires the global localization
-        manager to report LOCALIZED from a fresh state file. If the file is
-        entirely absent (localizer not deployed yet) this degrades to a
-        warning so the legacy setup keeps working."""
+        """Plan A hard gate, FAIL-CLOSED (P0 audit #11): GO2 motion requires
+        a fresh localization_state.json reporting LOCALIZED for the active
+        map. A missing file means the localizer is not running — that is a
+        stop condition, never a bypass."""
         path = Path("/project/runtime/localization_state.json")
         try:
             loc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self.get_logger().warn("localization_state.json 缺失，运动门禁未启用",
-                                   throttle_duration_sec=30.0)
-            return True
-        if time.time() - float(loc.get("updated_at", 0)) > 5.0:
+            self.get_logger().error("localization_state.json 缺失：定位未运行，禁止运动",
+                                    throttle_duration_sec=5.0)
+            return False
+        if time.time() - float(loc.get("updated_at", 0)) > 2.0:
             self.get_logger().error("定位状态过期，禁止运动", throttle_duration_sec=5.0)
             return False
-        return bool(loc.get("state") == "LOCALIZED" and loc.get("ok_for_navigation"))
+        if loc.get("state") != "LOCALIZED" or not loc.get("ok_for_navigation"):
+            return False
+        active_map = json.loads(Path("/project/patrol_data/active_map.json")
+                                .read_text(encoding="utf-8")).get("name")
+        if active_map and loc.get("map_id") != active_map:
+            self.get_logger().error(
+                f"定位地图({loc.get('map_id')})与活动地图({active_map})不一致，禁止运动",
+                throttle_duration_sec=5.0)
+            return False
+        return True
 
     def enabled(self):
         try:
@@ -352,3 +340,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def quat_matrix_from_odom(q):
+    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) or 1.0
+    qx, qy, qz, qw = q.x / n, q.y / n, q.z / n, q.w / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def tf_buffer_lookup(buffer, target, source):
+    """Latest TF as a 4x4 matrix; raises if the transform is unavailable."""
+    m = buffer.lookup_transform(target, source, Time())
+    tr = m.transform
+    matrix = np.eye(4)
+    matrix[:3, :3] = quat_matrix_from_odom(tr.rotation)
+    matrix[:3, 3] = [tr.translation.x, tr.translation.y, tr.translation.z]
+    return matrix

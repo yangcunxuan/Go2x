@@ -1103,6 +1103,15 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("机器狗当前位置不在当前地图的可通行区域，禁止规划")
                     if not point_is_navigable(point):
                         raise ValueError("该点不在导航地图的可通行区域，请重新选择地面位置")
+                # Final-plan gate layer: the global localizer must be
+                # LOCALIZED for the active map before any goal is issued.
+                loc = read_json(RUNTIME / "localization_state.json", {})
+                if time.time() - float(loc.get("updated_at", 0)) > 2.0 \
+                        or loc.get("state") != "LOCALIZED" \
+                        or not loc.get("ok_for_navigation"):
+                    raise ValueError("全局定位未就绪（未LOCALIZED），禁止下发目标")
+                if active and loc.get("map_id") != active.stem:
+                    raise ValueError("定位所在的地图与活动地图不一致，禁止下发目标")
                 baseline = int(go2_state().get("nav_relay", {}).get("publish_count", 0) or 0)
                 set_nav_motion(True, "导航到：" + point["name"])
                 goal = issue_goal(point)

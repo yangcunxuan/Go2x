@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
-"""Global localization manager (Plan A: Scan Context + GICP).
+"""Global localization manager (Plan A: Scan Context + two-stage GICP).
 
 Fully autonomous relocalization of the current FAST-LIO session against a
-saved 3D map. No manual initial pose.
+saved map package. No manual initial pose; no fallback transforms.
 
-Pipeline
+Pipeline per cycle:
   1. Accumulate a short window of /cloud_registered (camera_init frame).
-  2. Describe the window with Scan Context; retrieve top-k keyframe
-     candidates from the map database (db.npz built by build_map_db).
-  3. For every candidate: crop a local submap from the map PCD around the
-     candidate pose and register the window against it (small_gicp, with an
-     open3d fallback), using the candidate pose as the initial guess.
-  4. Uniqueness check: the best candidate must clearly beat the runner-up.
-     If ambiguous, stay SEARCHING — never guess (硬约束: 定位不唯一就停止).
-  5. VERIFYING: require N consecutive consistent alignments before
-     publishing. Then LOCALIZED: publish the dynamic TF map_level→camera_init
-     and keep tracking at ~1 Hz against a local submap, degrading to
-     DEGRADED/LOST when match quality drops. LOST restarts a full search.
+  2. Describe the window in the CURRENT SENSOR frame (P0 audit #6: the
+     window is camera_init-world and must be centered by the live odometry
+     pose before the descriptor).
+  3. Scan Context retrieval over every map database (ring-key coarse
+     ranking, then exact sector-shift matching). Candidates from all maps
+     are merged and globally sorted by descriptor distance.
+  4. For each of the top candidates: initial transform
+        T(mapLevel<-cameraInit) =
+            T(mapLevel<-sensor_keyframe)
+            x Rz(yaw_shift)
+            x inverse(T(cameraInit<-sensor_current))
+     then two-stage small_gicp (coarse 0.5 m / 2.5 m, fine 0.2 m / 0.8 m).
+     GICP output IS map_level <- camera_init. No alignment file is involved.
+  5. Uniqueness by clustering the registration results: hypotheses closer
+     than 1.0 m / 10 deg merge; if the best two DIFFERENT hypotheses have
+     close quality the state is AMBIGUOUS and navigation stays blocked.
+  6. VERIFYING requires VERIFY_COUNT consecutive frames that each pass
+     converged + rmse + fitness + inlier gates. Only then LOCALIZED.
 
-State is published to runtime/localization_state.json for the web UI and the
-motion bridge hard gate (only LOCALIZED allows GO2 motion).
-
-TF chain: keyframe poses are stored in the map frame (the mapping session's
-camera_init). The published TF chains the fixed alignment transform
-(localization_alignment.json, map_level←map) with the estimated
-map←camera_init, so checkpoints and the web cloud stay in map_level.
+Outputs:
+  - dynamic TF map_level -> camera_init (the ONLY publisher of that TF in
+    localization mode)
+  - runtime/localization_state.json with boot_id/sequence for the web UI
+    and the motion bridge hard gate. Written first thing at startup as
+    UNINITIALIZED so a stale LOCALIZED from a previous run can never be
+    consumed.
 """
 import json
 import math
 import os
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +46,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from tf2_ros import TransformBroadcaster
@@ -46,10 +55,15 @@ RUNTIME = Path(os.environ.get('PATROL_RUNTIME', '/project/runtime'))
 DATA = Path(os.environ.get('PATROL_DATA', '/project/patrol_data'))
 
 WINDOW_SEC = 4.0
-WINDOW_VOXEL = 0.20
-SUBMAP_RADIUS = 15.0
+WINDOW_MIN_POINTS = 2000
+COARSE_VOXEL = 0.5
+COARSE_CORR = 2.5
+FINE_VOXEL = 0.2
+FINE_CORR = 0.8
+SUBMAP_RADIUS = 20.0
 TRACK_RADIUS = 25.0
 SEARCH_PERIOD = 1.0
+MIN_INLIERS = 500
 
 RMSE_MAX = float(os.environ.get('LOC_RMSE_MAX', '0.25'))
 OVERLAP_MIN = float(os.environ.get('LOC_OVERLAP_MIN', '0.50'))
@@ -60,28 +74,37 @@ VERIFY_YAW_TOL = math.radians(5.0)
 CORRECT_MAX = 0.30
 CORRECT_YAW_MAX = math.radians(10.0)
 LOST_CORRECT_MAX = 1.0
+CLUSTER_POS = 1.0
+CLUSTER_YAW = math.radians(10.0)
 
 
-def quat_yaw(q):
-    return math.atan2(2.0 * (q.z * q.w + q.x * q.y),
-                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+def angle_diff(a, b):
+    """Absolute angular difference with wraparound (P0 audit: +/-180 deg)."""
+    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
 
 
-def rpy_from_matrix(r):
-    pitch = math.atan2(-r[2, 0], math.hypot(r[0, 0], r[1, 0]))
-    if abs(pitch) < math.pi / 2 - 1e-6:
-        roll = math.atan2(r[2, 1], r[2, 2])
-        yaw = math.atan2(r[1, 0], r[0, 0])
-    else:
-        roll = math.atan2(-r[1, 2], r[1, 1])
-        yaw = 0.0
-    return roll, pitch, yaw
+def yaw_of(t):
+    return math.atan2(t[1, 0], t[0, 0])
 
 
-def transform_matrix(x, y, z, yaw):
-    c, s = math.cos(yaw), math.sin(yaw)
-    return np.array([[c, -s, 0, x], [s, c, 0, y], [0, 0, 1, z],
-                     [0, 0, 0, 1]], dtype=np.float64)
+def quat_matrix_from_msg(q):
+    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) or 1.0
+    qx, qy, qz, qw = q.x / n, q.y / n, q.z / n, q.w / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def quat_matrix(qx, qy, qz, qw):
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
 
 
 def voxel_downsample(points, voxel):
@@ -92,167 +115,137 @@ def voxel_downsample(points, voxel):
     return points[np.sort(index)]
 
 
+def evaluate_registration(target, transformed, cell=0.3):
+    """Self-computed quality metrics (small_gicp version-independent).
+
+    fitness: fraction of transformed source points landing within `cell` of
+    a target point (voxel-hash nearest-cell approximation).
+    rmse: RMS of the distance from each transformed source point to the
+    center of its nearest occupied target cell, over matched points.
+    """
+    if not len(target) or not len(transformed):
+        return 0.0, 1e3
+    t_keys = np.floor(target[:, :3] / cell).astype(np.int64)
+    s_keys = np.floor(transformed[:, :3] / cell).astype(np.int64)
+    t_map = {}
+    for key in map(tuple, t_keys):
+        t_map[key] = True
+    s_unique, counts = np.unique(s_keys, axis=0, return_counts=True)
+    hits = 0
+    for key, count in zip(map(tuple, s_unique), counts):
+        if key in t_map:
+            hits += count
+    fitness = hits / len(transformed) if len(transformed) else 0.0
+    # RMSE via nearest occupied-cell center distance for a sample of points
+    if t_map and len(transformed):
+        sample = transformed[::max(1, len(transformed) // 2000)]
+        t_arr = np.array(list(t_map.keys()), dtype=np.float64) * cell + cell / 2
+        sq = []
+        for p in sample:
+            d2 = np.min(np.sum((t_arr - p) ** 2, axis=1))
+            if d2 <= 0.5 ** 2 * 4:  # within 1 m
+                sq.append(d2)
+        rmse = math.sqrt(sum(sq) / len(sq)) if sq else 1e3
+    else:
+        rmse = 1e3
+    return fitness, rmse
+
+
 class Registration:
-    """small_gicp backend with an open3d fallback. align() returns
-    (T_target_source 4x4, rmse, fitness) or raises RuntimeError."""
+    """small_gicp backend (mandatory dependency, no silent fallback)."""
 
     def __init__(self, node):
+        import small_gicp  # noqa: F401
         self.node = node
-        self.backend = None
-        try:
-            import small_gicp  # noqa: F401
-            self.backend = 'small_gicp'
-        except ImportError:
-            try:
-                import open3d  # noqa: F401
-                self.backend = 'open3d'
-            except ImportError:
-                pass
-        if self.backend is None:
-            raise RuntimeError('未找到配准后端：请在镜像中安装 small_gicp 或 open3d')
-        node.get_logger().info(f'配准后端: {self.backend}')
+        node.get_logger().info('配准后端: small_gicp')
 
-    def align(self, target, source, init_t):
+    def align(self, target, source, init_t, voxel, max_corr):
+        import small_gicp
         target = np.ascontiguousarray(target[:, :3], dtype=np.float64)
         source = np.ascontiguousarray(source[:, :3], dtype=np.float64)
-        if self.backend == 'small_gicp':
-            import small_gicp
-            result = small_gicp.align(
-                target, source,
-                init_T_target_source=init_t,
-                downsample_resolution=WINDOW_VOXEL,
-                max_correspondence_distance=1.0,
-                num_threads=2)
-            t = np.asarray(result.T_target_source, dtype=np.float64)
-            rmse = float(result.rmse)
-            fitness = self._overlap(target, source @ t[:3, :3].T + t[:3, 3])
-            return t, rmse, fitness
-        import open3d as o3d
-        to3d = lambda p: o3d.geometry.PointCloud(
-            o3d.utility.Vector3dVector(np.ascontiguousarray(p[:, :3])))
-        t_cloud = to3d(target)
-        s_cloud = to3d(source)
-        s_cloud.transform(init_t.tolist())
-        reg = o3d.pipelines.registration.registration_icp(
-            s_cloud, t_cloud, 1.0,
-            np.eye(4),
-            o3d.pipelines.registration.TransformationEstimationPointToPoint())
-        t = np.asarray(reg.transformation, dtype=np.float64) @ init_t
-        fitness = float(reg.fitness)
-        rmse = float(reg.inlier_rmse) if reg.fitness > 0 else 1e3
-        return t, rmse, fitness
-
-    @staticmethod
-    def _overlap(target, transformed, cell=0.3):
-        """Fraction of transformed source points falling into an occupied
-        target voxel cell — cheap overlap metric without a KD-tree."""
-        if not len(target) or not len(transformed):
-            return 0.0
-        t_keys = np.floor(target[:, :3] / cell).astype(np.int64)
-        s_keys = np.floor(transformed[:, :3] / cell).astype(np.int64)
-        t_set = set(map(tuple, np.unique(t_keys, axis=0)))
-        s_set = set(map(tuple, np.unique(s_keys, axis=0)))
-        if not s_set:
-            return 0.0
-        return len(t_set & s_set) / len(s_set)
+        result = small_gicp.align(
+            target, source,
+            init_T_target_source=np.asarray(init_t, dtype=np.float64),
+            downsample_resolution=voxel,
+            max_correspondence_distance=max_corr,
+            num_threads=2)
+        t = np.asarray(result.T_target_source, dtype=np.float64)
+        transformed = source @ t[:3, :3].T + t[:3, 3]
+        fitness, rmse = evaluate_registration(target, transformed)
+        num_inliers = int(getattr(result, 'num_inliers', 0))
+        converged = bool(getattr(result, 'converged', False))
+        return {'T': t, 'converged': converged, 'num_inliers': num_inliers,
+                'fitness': fitness, 'rmse': rmse,
+                'quality_ok': (converged and fitness >= OVERLAP_MIN
+                               and rmse <= RMSE_MAX
+                               and num_inliers >= MIN_INLIERS)}
 
 
 class LocalizationManager(Node):
     def __init__(self):
         super().__init__('localization_manager')
-        self.map_name = os.environ.get('LOC_MAP_NAME', '')
+        self.boot_id = uuid.uuid4().hex
+        self.sequence = 0
         self.state = 'UNINITIALIZED'
-        self.map_id = None
-        self.dbs = {}          # map_name -> {'poses','descriptors','sc_shape'}
-        self.pcd = {}          # map_name -> points (N,3) map frame
-        self.registration = Registration(self)
-        self.window = []       # (t, points Nx3 camera_init)
-        self.last_process = 0.0
-        self.t_map_cam = None  # 4x4 map←camera_init
+        self.state_message = '启动'
         self.map_id_est = None
+        self.t_map_cam = None
+        self.candidate = None
         self.verify_results = []
         self.degraded_count = 0
-        self.last_correction = None
-        self.alignment = self.load_alignment()
+        self.last_margin = None
+        self.last_rmse = None
+        self.last_fitness = None
+        self.window = []
+        self.last_process = 0.0
+        self.t_cam_sensor = np.eye(4)   # live odometry pose
+        self.odo_seen = False
+        self.load_maps()
+        self.registration = Registration(self)
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(PointCloud2, '/cloud_registered',
-                                 self.on_cloud, qos)
+        self.create_subscription(PointCloud2, '/cloud_registered', self.on_cloud, qos)
         self.create_subscription(Odometry, '/Odometry', self.on_odom, qos)
-        self.odo_z = 0.0
-        self.candidate = None
         self.tf_broadcaster = TransformBroadcaster(self)
         self.create_timer(1.0, self.tick)
+        # First write MUST overwrite any stale state file from a previous run.
         self.write_state()
-        self.get_logger().info('全局定位管理器就绪（SEARCHING 待点云）')
+        self.get_logger().info(f'全局定位管理器就绪 boot_id={self.boot_id[:8]}')
 
-    # ---------- data loading ----------
-    def load_alignment(self):
-        try:
-            a = json.loads((RUNTIME / 'localization_alignment.json').read_text(
-                encoding='utf-8'))
-        except (OSError, ValueError):
-            a = {}
-        yaw = float(a.get('yaw', 0))
-        c, s = math.cos(yaw), math.sin(yaw)
-        t = np.array([float(a.get('x', 0)), float(a.get('y', 0)),
-                      float(a.get('z', 0))])
-        return {'rot': np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]), 't': t}
-
+    # ---------- data ----------
     def load_maps(self):
-        for db in sorted(DATA.glob('maps/*/db.npz')):
-            name = db.parent.name
-            if name in self.dbs:
+        for meta_path in sorted(DATA.glob('maps/*/metadata.json')):
+            map_id = meta_path.parent.name
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+            if not meta.get('localization_ready'):
+                continue
+            npy = meta_path.parent / 'map.npy'
+            db = meta_path.parent / 'db.npz'
+            if not npy.is_file() or not db.is_file():
                 continue
             try:
                 data = np.load(db)
-                pcd = next(db.parent.glob('*.pcd'))
-                pts = self.load_pcd(pcd)
-                if pts is None or len(data['poses']) < 3:
-                    continue
-                self.dbs[name] = data
-                self.pcd[name] = pts
+                points = np.load(npy, mmap_mode='r')
+                descriptors = data['descriptors']
+                entries = []
+                for i, d in enumerate(descriptors):
+                    sc = d.reshape(tuple(data['sc_shape']))
+                    entries.append({'sc': sc, 'ring_key': sc.mean(axis=1).astype(np.float32),
+                                    'index': i, 'pose': data['poses'][i]})
                 self.get_logger().info(
-                    f'载入地图数据库: {name} 关键帧={len(data["poses"])}')
+                    f'载入地图数据库: {map_id} 关键帧={len(entries)} 点云={points.shape[0]}')
+                self.dbs[map_id] = {'entries': entries, 'points': points,
+                                    'sc_shape': tuple(data['sc_shape'])}
             except (OSError, ValueError, KeyError) as exc:
-                self.get_logger().warning(f'跳过地图 {name}: {exc}')
-        if not self.dbs:
-            self.get_logger().error('没有任何可用地图数据库（需要先建图生成 db.npz）')
-
-    @staticmethod
-    def load_pcd(path):
-        """Binary/ascii PCD reader for x/y/z float32 clouds."""
-        data = Path(path).read_bytes()
-        try:
-            header_end = data.index(b'DATA ')
-        except ValueError:
-            return None
-        kind_line = data[header_end:header_end + 24].split(b'\n')[0]
-        kind = kind_line.split()[1].decode()
-        body_start = data.index(b'\n', header_end) + 1
-        fields = []
-        count = 0
-        for line in data[:header_end].decode('ascii', errors='replace').splitlines():
-            parts = line.split()
-            if not parts:
-                continue
-            if parts[0] == 'FIELDS':
-                fields = parts[1:]
-            elif parts[0] == 'POINTS':
-                count = int(parts[1])
-        float_cols = sum(1 for f in fields if f in ('x', 'y', 'z', 'intensity'))
-        if count <= 0 or float_cols < 3:
-            return None
-        if kind == 'ascii':
-            rows = np.loadtxt(data[body_start:].splitlines()[:count],
-                              usecols=(0, 1, 2))
-            return rows.reshape(-1, 3)
-        arr = np.frombuffer(data[body_start:body_start + count * 4 * float_cols],
-                            dtype=np.float32)
-        return arr.reshape(-1, float_cols)[:, :3].copy()
+                self.get_logger().warning(f'跳过地图 {map_id}: {exc}')
 
     # ---------- callbacks ----------
     def on_odom(self, msg):
-        self.odo_z = float(msg.pose.pose.position.z)
+        p = msg.pose.pose.position
+        t = np.eye(4)
+        t[:3, :3] = quat_matrix_from_msg(msg.pose.pose.orientation)
+        t[:3, 3] = [p.x, p.y, p.z]
+        self.t_cam_sensor = t
+        self.odo_seen = True
 
     def on_cloud(self, msg):
         try:
@@ -267,28 +260,38 @@ class LocalizationManager(Node):
         while self.window and now - self.window[0][0] > WINDOW_SEC + 2.0:
             self.window.pop(0)
 
-    # ---------- window helpers ----------
+    # ---------- window ----------
     def window_points(self):
-        if not self.window:
+        if not self.window or not self.odo_seen:
             return None
         now = time.monotonic()
         recent = [p for t, p in self.window if now - t <= WINDOW_SEC]
         if not recent:
             return None
         pts = np.vstack(recent)
-        if len(pts) < 2000:
+        if len(pts) < WINDOW_MIN_POINTS:
             return None
         return voxel_downsample(pts, WINDOW_VOXEL)
 
-    # ---------- main cycle ----------
+    def sensor_frame(self, points):
+        """camera_init world points -> current sensor frame (P0 audit #6)."""
+        inv = np.linalg.inv(self.t_cam_sensor)
+        return (np.ascontiguousarray(points, dtype=np.float64)
+                @ inv[:3, :3].T + inv[:3, 3])
+
+    # ---------- cycle ----------
     def tick(self):
         window = self.window_points()
         if window is None:
-            if self.state in ('SEARCHING', 'UNINITIALIZED'):
+            if self.state in ('SEARCHING', 'UNINITIALIZED', 'LOST'):
                 self.set_state('SEARCHING', '等待当前点云积累')
+            self.publish_tf()
+            self.write_state()
             return
         now = time.monotonic()
         if now - self.last_process < SEARCH_PERIOD:
+            self.publish_tf()
+            self.write_state()
             return
         self.last_process = now
 
@@ -301,144 +304,153 @@ class LocalizationManager(Node):
         self.publish_tf()
         self.write_state()
 
-    # ---------- search / verify / track ----------
+    # ---------- search ----------
     def do_search(self, window):
-        if not self.dbs:
-            self.load_maps()
-            if not self.dbs:
-                self.set_state('SEARCHING', '无可用地图数据库')
-                return
-        results = self.match_all(window)
-        if not results:
+        from patrol_global_localization.scan_context import (
+            make_descriptor_height, search)
+        query = make_descriptor_height(self.sensor_frame(window), sensor_z=0.0)
+        all_candidates = []
+        for map_name, bundle in self.dbs.items():
+            try:
+                top = search(bundle['entries'], query, topk=5)
+            except Exception as exc:
+                self.get_logger().warning(f'{map_name} 检索失败: {exc}')
+                continue
+            for entry, dist, shift in top:
+                all_candidates.append({'map': map_name, 'entry': entry,
+                                       'dist': dist, 'shift': shift})
+        all_candidates.sort(key=lambda c: c['dist'])
+        scored = []
+        sector_angle = 2 * math.pi / self.dbs[all_candidates[0]['map']]['sc_shape'][1] \
+            if all_candidates else 0.0
+        for cand in all_candidates[:8]:
+            pose = cand['entry']['pose']
+            t_map_sensor_kf = np.eye(4)
+            t_map_sensor_kf[:3, :3] = quat_matrix(*pose[3:7])
+            t_map_sensor_kf[:3, 3] = pose[:3]
+            # yaw shift from the sector match; sign verified by the
+            # descriptor_yaw_shift_sign unit test
+            yaw_fix = cand['shift'] * sector_angle
+            init = (t_map_sensor_kf
+                    @ transform_yaw(yaw_fix)
+                    @ np.linalg.inv(self.t_cam_sensor))
+            result = self.align_one(cand['map'], window, init)
+            if result is None:
+                continue
+            scored.append({**cand, **result,
+                           'x': float(result['T'][0, 3]),
+                           'y': float(result['T'][1, 3]),
+                           'yaw': yaw_of(result['T'])})
+        if not scored:
             self.set_state('SEARCHING', '所有候选配准失败')
             return
-        best, second = results[0], (results[1] if len(results) > 1 else None)
-        # Uniqueness: a runner-up at a DIFFERENT place (>2 m away) with a
-        # close score means the environment is ambiguous — refuse to guess.
-        # Runners-up near the best position are the same place (nearby
-        # keyframes) and are harmless.
-        ambiguous = (second is not None and
-                     second['fitness'] > best['fitness'] - UNIQUE_MARGIN and
-                     math.hypot(second['x'] - best['x'],
-                                second['y'] - best['y']) > 2.0)
-        if ambiguous:
+        # Cluster hypotheses: position <1.0 m and yaw <10 deg merge.
+        clusters = []
+        for cand in sorted(scored, key=lambda c: -c['fitness']):
+            for cluster in clusters:
+                head = cluster[0]
+                if (math.hypot(cand['x'] - head['x'], cand['y'] - head['y']) < CLUSTER_POS
+                        and angle_diff(cand['yaw'], head['yaw']) < CLUSTER_YAW
+                        and cand['map'] == head['map']):
+                    cluster.append(cand)
+                    break
+            else:
+                clusters.append([cand])
+        clusters.sort(key=lambda c: -max(member['fitness'] for member in c))
+        best_cluster = clusters[0]
+        best = max(best_cluster, key=lambda c: c['fitness'])
+        if len(clusters) > 1:
+            second_best = max(clusters[1], key=lambda c: c['fitness'])
+            margin = best['fitness'] - second_best['fitness']
+            if margin < UNIQUE_MARGIN:
+                self.set_state('AMBIGUOUS',
+                               f'两个位置假设质量接近(边距{margin:.2f})，禁止导航')
+                return
+        self.last_margin = margin if len(clusters) > 1 else None
+        if not best['quality_ok']:
             self.set_state('SEARCHING',
-                           f"候选不唯一(次选 {second['map']}"
-                           f"@({second['x']:.1f},{second['y']:.1f}) "
-                           f"fitness={second['fitness']:.2f})，拒绝猜测")
+                           f"最佳候选质量不足(fitness={best['fitness']:.2f} "
+                           f"rmse={best['rmse']:.2f})")
             return
         self.candidate = best
         self.verify_results = []
         self.set_state('VERIFYING',
                        f"候选 {best['map']}@({best['x']:.1f},{best['y']:.1f}) "
-                       f"fitness={best['fitness']:.2f} rmse={best['rmse']:.2f}")
+                       f"fitness={best['fitness']:.2f}")
 
     def do_verify(self, window):
         best = self.candidate
-        result = self.align_one(best['map'], window, best['t'],
-                                submap_radius=SUBMAP_RADIUS)
-        if result is None:
+        result = self.align_one(best['map'], window, best['T'])
+        if result is None or not result['quality_ok']:
             self.verify_results = []
-            self.set_state('SEARCHING', '验证期配准失败，重新检索')
+            self.set_state('SEARCHING', '验证帧质量不足，重新检索')
             return
-        t, rmse, fitness = result
-        pos = t[:3, 3]
-        consistent = True
-        for prev_t, prev_rmse, prev_fit in self.verify_results:
-            if (np.linalg.norm(pos - prev_t[:3, 3]) > VERIFY_POS_TOL or
-                    abs(yaw_of(t) - yaw_of(prev_t)) > VERIFY_YAW_TOL):
-                consistent = False
-                break
+        t = result['T']
+        consistent = all(
+            np.linalg.norm(t[:3, 3] - prev['T'][:3, 3]) <= VERIFY_POS_TOL
+            and angle_diff(yaw_of(t), yaw_of(prev['T'])) <= VERIFY_YAW_TOL
+            for prev in self.verify_results)
         if not consistent:
-            self.verify_results = [(t, rmse, fitness)]
+            self.verify_results = [result]
             self.set_state('VERIFYING', '验证帧不一致，重新计数')
             return
-        self.verify_results.append((t, rmse, fitness))
+        self.verify_results.append(result)
         if len(self.verify_results) >= VERIFY_COUNT:
             self.t_map_cam = t
             self.map_id_est = best['map']
             self.degraded_count = 0
-            self.last_correction = None
-            self._last_rmse = rmse
+            self.last_rmse = result['rmse']
+            self.last_fitness = result['fitness']
             self.set_state('LOCALIZED',
-                           f"定位成功 map={best['map']} fitness={fitness:.2f}")
+                           f"定位成功 map={best['map']} "
+                           f"fitness={result['fitness']:.2f}")
         else:
-            self.set_state('VERIFYING',
-                           f'验证 {len(self.verify_results)}/{VERIFY_COUNT}')
+            self.set_state('VERIFYING', f'验证 {len(self.verify_results)}/{VERIFY_COUNT}')
 
     def do_track(self, window):
-        result = self.align_one(self.map_id_est, window, self.t_map_cam,
-                                submap_radius=TRACK_RADIUS)
-        if result is None:
+        result = self.align_one(self.map_id_est, window, self.t_map_cam)
+        if result is None or not result['quality_ok']:
             self.degraded_count += 3
         else:
-            t, rmse, fitness = result
-            jump = np.linalg.norm(t[:3, 3] - self.t_map_cam[:3, 3])
-            jump_yaw = abs(yaw_of(t) - yaw_of(self.t_map_cam))
+            t = result['T']
+            jump = float(np.linalg.norm(t[:3, 3] - self.t_map_cam[:3, 3]))
+            jump_yaw = angle_diff(yaw_of(t), yaw_of(self.t_map_cam))
             if jump > LOST_CORRECT_MAX or jump_yaw > math.radians(20):
                 self.set_state('LOST', f'修正量异常({jump:.2f}m)，重新全局检索')
                 self.degraded_count = 0
+                self.t_map_cam = None
                 return
             self.t_map_cam = t
-            self._last_rmse = rmse
-            if (rmse > RMSE_MAX or fitness < OVERLAP_MIN or
-                    jump > CORRECT_MAX or jump_yaw > CORRECT_YAW_MAX):
+            self.last_rmse = result['rmse']
+            self.last_fitness = result['fitness']
+            if (jump > CORRECT_MAX or jump_yaw > CORRECT_YAW_MAX):
                 self.degraded_count += 1
             else:
                 self.degraded_count = 0
         if self.degraded_count >= 6:
             self.set_state('LOST', '连续匹配失败，重新全局检索')
             self.degraded_count = 0
+            self.t_map_cam = None
         elif self.degraded_count >= 3:
             self.set_state('DEGRADED', '匹配质量下降')
 
-    # ---------- registration helpers ----------
-    def match_all(self, window):
-        """Full search across all loaded maps. Returns scored candidates."""
-        from patrol_global_localization.scan_context import (
-            make_descriptor_height, search)
-        sensor_z = self.odo_z
-        query = make_descriptor_height(window, sensor_z=sensor_z)
-        candidates = []
-        for map_name, db in self.dbs.items():
-            entries = [{'sc': d.reshape(tuple(db['sc_shape'])), 'index': i}
-                       for i, d in enumerate(db['descriptors'])]
-            try:
-                top = search(entries, query, topk=5)
-            except Exception as exc:
-                self.get_logger().warning(f'{map_name} 检索失败: {exc}')
-                continue
-            for entry, dist, shift in top:
-                pose = db['poses'][entry['index']]
-                candidates.append({'map': map_name, 'index': entry['index'],
-                                   'x': float(pose[0]), 'y': float(pose[1]),
-                                   'z': float(pose[2]), 'yaw': float(pose[3]),
-                                   'sc_dist': dist})
-        scored = []
-        for cand in candidates[:8]:
-            init_t = transform_matrix(cand['x'], cand['y'], cand['z'],
-                                      cand['yaw'])
-            result = self.align_one(cand['map'], window, init_t,
-                                    submap_radius=SUBMAP_RADIUS)
-            if result is None:
-                continue
-            t, rmse, fitness = result
-            scored.append({**cand, 't': t, 'rmse': rmse, 'fitness': fitness})
-        scored.sort(key=lambda c: (-c['fitness'], c['rmse']))
-        return scored
-
-    def align_one(self, map_name, window, init_t, submap_radius):
-        pts = self.pcd.get(map_name)
+    def align_one(self, map_name, window, init_t):
+        pts = self.dbs.get(map_name, {}).get('points')
         if pts is None:
             return None
-        center = (init_t @ np.array([0, 0, 0, 1.0]))[:3]
+        center = (np.asarray(init_t) @ np.array([0, 0, 0, 1.0]))[:3]
         d = np.hypot(pts[:, 0] - center[0], pts[:, 1] - center[1])
-        submap = pts[d <= submap_radius]
+        submap = np.asarray(pts[d <= SUBMAP_RADIUS])
         if len(submap) < 1000:
             return None
         try:
-            return self.registration.align(submap, window, np.asarray(init_t,
-                                                                       dtype=np.float64))
+            coarse = self.registration.align(submap, window, init_t,
+                                             COARSE_VOXEL, COARSE_CORR)
+            if not coarse['converged'] or coarse['fitness'] < 0.2:
+                return None
+            fine = self.registration.align(submap, window, coarse['T'],
+                                           FINE_VOXEL, FINE_CORR)
+            return fine
         except Exception as exc:
             self.get_logger().warning(f'配准异常: {exc}')
             return None
@@ -447,17 +459,16 @@ class LocalizationManager(Node):
     def publish_tf(self):
         if self.t_map_cam is None or self.state not in ('LOCALIZED', 'DEGRADED'):
             return
-        a_rot, a_t = self.alignment['rot'], self.alignment['t']
-        full = a_rot @ self.t_map_cam[:3, :3]
-        trans = a_rot @ self.t_map_cam[:3, 3] + a_t
-        roll, pitch, yaw = rpy_from_matrix(full)
+        # The GICP result IS map_level <- camera_init (map_level data end to
+        # end); no alignment file is chained here.
+        t = self.t_map_cam
         msg = TransformStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map_level'
         msg.child_frame_id = 'camera_init'
         msg.transform.translation.x, msg.transform.translation.y, \
-            msg.transform.translation.z = trans
-        qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+            msg.transform.translation.z = t[0, 3], t[1, 3], t[2, 3]
+        qx, qy, qz, qw = quat_from_matrix_pub(t[:3, :3])
         msg.transform.rotation.x, msg.transform.rotation.y = qx, qy
         msg.transform.rotation.z, msg.transform.rotation.w = qz, qw
         self.tf_broadcaster.sendTransform(msg)
@@ -469,36 +480,54 @@ class LocalizationManager(Node):
         self.state_message = message
 
     def write_state(self):
-        t = self.t_map_cam
+        self.sequence += 1
         payload = {
             'state': self.state,
             'map_id': self.map_id_est,
-            'message': getattr(self, 'state_message', ''),
-            'position': [round(float(v), 3) for v in t[:3, 3]] if t is not None else None,
-            'yaw': round(float(yaw_of(t)), 3) if t is not None else None,
-            'rmse': getattr(self, '_last_rmse', None),
+            'boot_id': self.boot_id,
+            'sequence': self.sequence,
+            'message': self.state_message,
+            'position': ([round(float(v), 3) for v in self.t_map_cam[:3, 3]]
+                         if self.t_map_cam is not None else None),
+            'yaw': round(float(yaw_of(self.t_map_cam)), 3) if self.t_map_cam is not None else None,
+            'rmse': round(float(self.last_rmse), 3) if self.last_rmse else None,
+            'fitness': round(float(self.last_fitness), 3) if self.last_fitness else None,
+            'candidate_margin': round(float(self.last_margin), 3) if self.last_margin else None,
+            'verified_frames': len(self.verify_results),
             'updated_at': time.time(),
+            'ok_for_navigation': self.state == 'LOCALIZED',
         }
-        if t is not None and self.state in ('LOCALIZED', 'DEGRADED'):
-            payload['ok_for_navigation'] = True
-        else:
-            payload['ok_for_navigation'] = False
         tmp = Path(str(RUNTIME / 'localization_state.json') + '.tmp')
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                        encoding='utf-8')
         os.replace(tmp, RUNTIME / 'localization_state.json')
 
 
-def yaw_of(t):
-    return math.atan2(t[1, 0], t[0, 0])
+def quat_from_matrix_pub(r):
+    tr = r[0, 0] + r[1, 1] + r[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        return ((r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s,
+                (r[1, 0] - r[0, 1]) / s, 0.25 * s)
+    i = int(np.argmax(np.diag(r)))
+    if i == 0:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        return (0.25 * s, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s,
+                (r[2, 1] - r[1, 2]) / s)
+    if i == 1:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        return ((r[0, 1] + r[1, 0]) / s, 0.25 * s, (r[1, 2] + r[2, 1]) / s,
+                (r[0, 2] - r[2, 0]) / s)
+    s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+    return ((r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, 0.25 * s,
+            (r[1, 0] - r[0, 1]) / s)
 
 
-def quat_from_rpy(roll, pitch, yaw):
-    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
-    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
-    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
-    return (sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
-            cr * cp * sy + sr * sp * cy, cr * cp * cy + sr * sp * sy)
+def transform_yaw(yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    t = np.eye(4)
+    t[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return t
 
 
 def main():
