@@ -1,0 +1,16 @@
+.teleop-state { font-size: 11px; color: var(--red); }
+.teleop-state.armed { color: var(--green); }
+.teleop-panel { padding: 12px; border-bottom: 1px solid var(--line); }
+.teleop-arm { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.teleop-arm button { flex: 1; }
+.teleop-arm label { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
+.teleop-arm select { padding: 7px; width: 128px; }
+.drive-pad, .turn-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.turn-row { margin-bottom: 7px; }
+.drive-key { height: 52px; padding: 5px; display: flex; align-items: center; justify-content: center; gap: 7px; user-select: none; touch-action: none; }
+.drive-key kbd { font: bold 13px ui-monospace, monospace; color: var(--blue); }
+.drive-key span { font-size: 18px; }
+.drive-key.stop { border-color: #75414b; }
+.drive-key.active { background: #176a9f; border-color: #5ebeff; box-shadow: 0 0 15px #218ed566; }
+.teleop-help { font-size: 11px; color: var(--muted); line-height: 1.55; margin: 11px 2px 0; }
+.mapping-controls .list { max-height: 260px; overflow: auto; }

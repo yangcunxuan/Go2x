@@ -1,0 +1,28 @@
+.actions { align-items: center; }
+.sensor-badge {
+  padding: 8px 11px;
+  border: 1px solid #23684c;
+  border-radius: 8px;
+  background: #0d2c20;
+  color: #71e6aa;
+  font: 12px ui-monospace, monospace;
+}
+#cloudCanvas { cursor: grab; touch-action: none; }
+#cloudCanvas.dragging { cursor: grabbing; }
+#cloudCanvas.selecting { cursor: crosshair; }
+.cloud-stage { position: relative; height: 600px; min-height: 0; }
+.cloud-stage #cloudCanvas { display: block; width: 100%; height: 100%; }
+#cloudMarkers { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.cloud-marker {
+  position: absolute;
+  transform: translate(-5px, -50%);
+  padding: 3px 7px 3px 14px;
+  border: 1px solid #7bc9ff;
+  border-radius: 12px;
+  background: rgba(4, 24, 39, .86);
+  color: #eaf7ff;
+  font: 11px ui-monospace, monospace;
+  white-space: nowrap;
+}
+.cloud-marker::before { content: ''; position: absolute; left: 3px; top: 50%; width: 7px; height: 7px; margin-top: -4px; border-radius: 50%; background: #39a7ff; }
+@media(max-width:650px){.cloud-stage{height:430px}}

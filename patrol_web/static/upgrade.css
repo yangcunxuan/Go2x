@@ -1,0 +1,6 @@
+.robot-metrics{grid-template-columns:repeat(3,1fr);row-gap:22px}
+.robot-metrics div:nth-child(3n){border-right:0}
+.coordinates.xyz{grid-template-columns:repeat(4,1fr)}
+@media(max-width:650px){.robot-metrics{grid-template-columns:1fr 1fr}.coordinates.xyz{grid-template-columns:1fr 1fr}}
+.stale-warning{color:#ff9b4a;font-size:12px;font-weight:700}
+button:disabled{opacity:.45;cursor:not-allowed}

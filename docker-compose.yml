@@ -1,0 +1,24 @@
+version: "3.7"
+
+services:
+  ros2:
+    build:
+      context: .
+      args:
+        USER_UID: "${HOST_UID:-1000}"
+        USER_GID: "${HOST_GID:-1000}"
+    image: go2-mid360:humble
+    network_mode: host
+    ipc: host
+    environment:
+      DISPLAY: "${DISPLAY:-:0}"
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-42}"
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      CYCLONEDDS_URI: file:///project/config/cyclonedds.xml
+      QT_X11_NO_MITSHM: "1"
+    volumes:
+      - .:/project
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    working_dir: /project
+    stdin_open: true
+    tty: true

@@ -1,0 +1,11 @@
+.actions { align-items: center; }
+.sensor-badge {
+  padding: 8px 11px;
+  border: 1px solid #23684c;
+  border-radius: 8px;
+  background: #0d2c20;
+  color: #71e6aa;
+  font: 12px ui-monospace, monospace;
+}
+#cloudCanvas { cursor: grab; touch-action: none; }
+#cloudCanvas.dragging { cursor: grabbing; }

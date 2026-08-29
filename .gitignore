@@ -1,0 +1,11 @@
+runtime/
+patrol_data/
+maps/
+logs/
+__pycache__/
+*.pyc
+install/
+build/
+log/
+*.pcd
+*.bak*

@@ -1,0 +1,271 @@
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: body
+    global_frame_id: map_level
+    odom_frame_id: camera_init
+    robot_model_type: nav2_amcl::OmniMotionModel
+    scan_topic: /scan
+    laser_model_type: likelihood_field
+    laser_min_range: 0.2
+    laser_max_range: 20.0
+    max_beams: 90
+    min_particles: 300
+    max_particles: 1500
+    update_min_d: 0.0
+    update_min_a: 0.0
+    transform_tolerance: 0.5
+    tf_broadcast: true
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map_level
+    robot_base_frame: body
+    default_nav_to_pose_bt_xml: /project/config/navigate_to_pose_no_recovery.xml
+    odom_topic: /Odometry
+    # The Ubuntu host also runs FAST-LIO and point-cloud conversion.  A slower
+    # BT tick and a realistic action acknowledgement timeout prevent transient
+    # CPU load from aborting an otherwise valid FollowPath goal.
+    bt_loop_duration: 50
+    default_server_timeout: 1000
+    wait_for_service_timeout: 1000
+
+bt_navigator_navigate_through_poses_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+bt_navigator_navigate_to_pose_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 5.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.5
+    progress_checker_plugin: progress_checker
+    goal_checker_plugins: [general_goal_checker]
+    controller_plugins: [FollowPath]
+    progress_checker:
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.10
+      # GO2 motion is pulsed and a large initial heading correction can take
+      # tens of seconds without translation.  Keep the progress watchdog, but
+      # allow that verified rotate-in-place phase to finish.
+      movement_time_allowance: 75.0
+    general_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      stateful: false
+      xy_goal_tolerance: 0.12
+      # Arrival is position-based; patrol tasks do not need to spend motor
+      # time matching the checkpoint's final camera heading.
+      yaw_goal_tolerance: 3.14
+    FollowPath:
+      # DWB plans a true left/right bypass with GO2's available lateral gait.
+      # The motion bridge serializes its vector: lateral while the front is
+      # blocked, then forward after the corridor is clear (never diagonal).
+      plugin: dwb_core::DWBLocalPlanner
+      debug_trajectory_details: false
+      min_vel_x: -0.20
+      min_vel_y: -0.20
+      max_vel_x: 0.20
+      max_vel_y: 0.20
+      max_vel_theta: 0.0
+      min_speed_xy: 0.0
+      max_speed_xy: 0.20
+      min_speed_theta: 0.0
+      acc_lim_x: 0.30
+      acc_lim_y: 0.30
+      acc_lim_theta: 0.0
+      decel_lim_x: -0.40
+      decel_lim_y: -0.40
+      decel_lim_theta: 0.0
+      vx_samples: 5
+      vy_samples: 5
+      vtheta_samples: 1
+      sim_time: 1.0
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.3
+      xy_goal_tolerance: 0.12
+      trans_stopped_velocity: 0.05
+      short_circuit_trajectory_evaluation: true
+      stateful: false
+      critics: [Oscillation, BaseObstacle, PathDist, GoalDist]
+      BaseObstacle.scale: 0.02
+      PathDist.scale: 32.0
+      PathDist.forward_point_distance: 0.10
+      GoalDist.scale: 24.0
+      GoalDist.forward_point_distance: 0.10
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 8.0
+      publish_frequency: 3.0
+      global_frame: camera_init
+      robot_base_frame: body
+      use_sim_time: false
+      rolling_window: true
+      width: 4
+      height: 4
+      resolution: 0.05
+      footprint: "[[0.36,0.23],[0.36,-0.23],[-0.36,-0.23],[-0.36,0.23]]"
+      plugins: [obstacle_layer, inflation_layer]
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          obstacle_min_range: 0.20
+          obstacle_max_range: 4.0
+          raytrace_min_range: 0.20
+          raytrace_max_range: 5.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.42
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: map_level
+      robot_base_frame: body
+      use_sim_time: false
+      footprint: "[[0.36,0.23],[0.36,-0.23],[-0.36,-0.23],[-0.36,0.23]]"
+      resolution: 0.05
+      track_unknown_space: true
+      # The static map supplies permanent structure while the live layer lets
+      # Navfn replan around newly placed obstacles.  Scan generation removes
+      # only returns inside the robot body; a real obstacle at 0.50 m remains.
+      plugins: [static_layer, obstacle_layer, inflation_layer]
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        footprint_clearing_enabled: true
+        combination_method: 1
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          obstacle_min_range: 0.40
+          obstacle_max_range: 4.0
+          raytrace_min_range: 0.40
+          raytrace_max_range: 5.0
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.42
+      always_send_full_costmap: true
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    yaml_filename: ""
+    frame_id: map_level
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    save_map_timeout: 10.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: true
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    use_sim_time: false
+    planner_plugins: [GridBased]
+    GridBased:
+      plugin: nav2_navfn_planner/NavfnPlanner
+      tolerance: 0.25
+      use_astar: true
+      allow_unknown: true
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins: [simple_smoother]
+    simple_smoother:
+      plugin: nav2_smoother::SimpleSmoother
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+
+behavior_server:
+  ros__parameters:
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: [spin, backup, drive_on_heading, wait]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    drive_on_heading:
+      plugin: nav2_behaviors/DriveOnHeading
+    wait:
+      plugin: nav2_behaviors/Wait
+    global_frame: camera_init
+    robot_base_frame: body
+    transform_tolerance: 0.2
+    use_sim_time: false
+    simulate_ahead_time: 1.5
+    max_rotational_vel: 0.25
+    min_rotational_vel: 0.08
+    rotational_acc_lim: 0.60
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 10
+    stop_on_failure: true
+    waypoint_task_executor_plugin: wait_at_waypoint
+    wait_at_waypoint:
+      plugin: nav2_waypoint_follower::WaitAtWaypoint
+      enabled: true
+      waypoint_pause_duration: 1000
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: true
+    feedback: OPEN_LOOP
+    max_velocity: [0.20, 0.20, 0.0]
+    min_velocity: [-0.20, -0.20, 0.0]
+    max_accel: [0.30, 0.30, 0.0]
+    max_decel: [-0.40, -0.40, 0.0]
+    odom_topic: /Odometry
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.25

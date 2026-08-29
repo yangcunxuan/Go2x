@@ -1,0 +1,39 @@
+.actions { align-items: center; }
+.sensor-badge {
+  padding: 8px 11px;
+  border: 1px solid #23684c;
+  border-radius: 8px;
+  background: #0d2c20;
+  color: #71e6aa;
+  font: 12px ui-monospace, monospace;
+}
+#cloudCanvas,#navCloudCanvas { cursor: grab; touch-action: none; }
+#cloudCanvas.dragging,#navCloudCanvas.dragging { cursor: grabbing; }
+#cloudCanvas.selecting { cursor: crosshair; }
+.cloud-stage { position: relative; height: 600px; min-height: 0; }
+.cloud-stage canvas { display: block; width: 100%; height: 100%; }
+#cloudMarkers,#navCloudMarkers { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.nav-route{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.nav-route polyline{fill:none;stroke-linecap:round;stroke-linejoin:round}
+.nav-route-glow{stroke:#00d8ff55;stroke-width:9}
+.nav-route-line{stroke:#47e7ff;stroke-width:3;stroke-dasharray:10 5;animation:route-flow 1s linear infinite}
+.nav-route-start{fill:#35d582;stroke:#d9ffec;stroke-width:2}
+.nav-route-goal{fill:#ffb02e;stroke:#fff1cf;stroke-width:3}
+@keyframes route-flow{to{stroke-dashoffset:-15}}
+.cloud-marker {
+  position: absolute;
+  transform: translate(-5px, -50%);
+  padding: 3px 7px 3px 14px;
+  border: 1px solid #7bc9ff;
+  border-radius: 12px;
+  background: rgba(4, 24, 39, .86);
+  color: #eaf7ff;
+  font: 11px ui-monospace, monospace;
+  white-space: nowrap;
+}
+.cloud-marker::before { content: ''; position: absolute; left: 3px; top: 50%; width: 7px; height: 7px; margin-top: -4px; border-radius: 50%; background: #39a7ff; }
+.cloud-robot{position:absolute;display:flex;align-items:center;gap:8px;transform:translate(-14px,-14px);color:#baffda;font:10px ui-monospace,monospace;white-space:nowrap;filter:drop-shadow(0 1px 4px #000)}
+.cloud-robot i{display:block;width:30px;height:20px;transform:rotate(var(--heading,0rad));transform-origin:center;background:#35d582;clip-path:polygon(100% 50%,35% 0,35% 28%,0 28%,0 72%,35% 72%,35% 100%)}
+.cloud-robot b{padding:3px 6px;border:1px solid #35d58277;border-radius:5px;background:#052017dd;font-weight:600}
+.active-map{border-color:#35d582;background:#0c2019}.map-active{font-size:10px;color:#35d582}.compact-list{max-height:330px;overflow:auto}.posture-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+@media(max-width:650px){.cloud-stage{height:430px}}
