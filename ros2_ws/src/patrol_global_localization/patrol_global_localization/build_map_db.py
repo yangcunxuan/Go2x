@@ -73,8 +73,10 @@ def main():
         if len(local_global) < 100:
             continue
         # to the keyframe's sensor frame, then to the descriptor
-        local = (np.ascontiguousarray(local_global[:, :3], dtype=np.float64)
-                 @ t_sensor_map[:3, :3].T + t_sensor_map[:3, 3])
+        # np.dot (not @): the matmul operator triggers spurious
+        # divide-by-zero warnings on macOS Accelerate numpy 2.0.2
+        local = (np.dot(np.ascontiguousarray(local_global[:, :3], dtype=np.float64),
+                        t_sensor_map[:3, :3].T) + t_sensor_map[:3, 3])
         sc = make_descriptor_height(local, sensor_z=0.0)
         q = rotation_to_quat(t_map_sensor[:3, :3])
         poses.append([kf['x'], kf['y'], kf['z'], q[0], q[1], q[2], q[3], 0.0])

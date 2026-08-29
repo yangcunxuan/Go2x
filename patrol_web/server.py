@@ -1003,7 +1003,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not service_status().get("mapping", {}).get("running"):
                     raise ValueError("建图会话已结束，停止时已自动保存，无需再次保存")
                 result = save_cloud_map(str(data.get("name", ""))) if config()["sensor"] == "mid360" else save_map(str(data.get("name", "")))
-                if result.get("name") and not result.get("nav_error"):
+                # Activate only a localization-ready package (P1 audit: a
+                # map whose DB failed must never become the navigation map).
+                if result.get("name") and result.get("localization_ready") and not result.get("nav_error"):
                     write_json(ACTIVE_MAP_FILE, {"name": result["name"], "updated_at": time.time()})
                 self.json_response(200, result)
             elif path == "/api/maps/activate":
@@ -1111,10 +1113,12 @@ class Handler(BaseHTTPRequestHandler):
                 require_go2_motion_safe()
                 point = next((p for p in read_json(CHECKPOINTS_FILE, []) if p["id"] == str(data.get("id"))), None)
                 if not point: raise ValueError("巡查点不存在")
-                active = latest_nav_map()
-                active_meta = read_json(active.with_suffix(".meta.json"), {}) if active else {}
-                map_mode = bool(active and active_meta.get("session_id") == mapping_session().get("id"))
-                active_name = active.stem if map_mode else None
+                map_mode = False
+                active_mid = active_map_id()
+                if active_mid:
+                    packaged_meta = read_json(DATA / "maps" / active_mid / "metadata.json", {})
+                    map_mode = bool(packaged_meta.get("localization_ready"))
+                active_name = active_mid if map_mode else None
                 session_ok = (point.get("map_name") == "__live__" and
                               point.get("session_id") == mapping_session().get("id"))
                 if point.get("map_name") != active_name and not session_ok:

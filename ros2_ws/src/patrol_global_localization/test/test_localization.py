@@ -54,11 +54,11 @@ def test_descriptor_translation_invariance():
                              rng.uniform(-0.5, 1.5, 5000)])
     t1 = yaw_matrix(0, 0, 0, 0.3)
     t2 = yaw_matrix(10, 5, -0.2, 0.3)
-    p1 = local @ t1[:3, :3].T + t1[:3, 3]
-    p2 = local @ t2[:3, :3].T + t2[:3, 3]
+    p1 = np.dot(local, t1[:3, :3].T) + t1[:3, 3]
+    p2 = np.dot(local, t2[:3, :3].T) + t2[:3, 3]
     sc1 = make_descriptor_height(p1, sensor_z=0.0)
     # sensor moved 0.2 m up: sensor_z compensates in the local transform
-    p2_local = (p2 - [10, 5, -0.2]) @ t2[:3, :3]  # inverse rotation = transpose
+    p2_local = np.dot(p2 - [10, 5, -0.2], t2[:3, :3])  # inverse rotation = transpose
     sc2 = make_descriptor_height(p2_local, sensor_z=0.0)
     assert distance(sc1, sc2)[0] < 0.05
 
@@ -70,7 +70,7 @@ def test_descriptor_yaw_shift_sign():
                              rng.uniform(0, 1, 6000)])
     sc0 = make_descriptor_height(local, sensor_z=0.0)
     rot90 = yaw_matrix(0, 0, 0, math.pi / 2)
-    rotated = local @ rot90[:3, :3].T
+    rotated = np.dot(local, rot90[:3, :3].T)
     sc90 = make_descriptor_height(rotated, sensor_z=0.0)
     dist, shift = distance(sc0, sc90)
     sector_angle = 2 * math.pi / sc0.shape[1]
@@ -142,7 +142,7 @@ def test_relocalization_recovers_known_transform(tmp_path):
     d = np.linalg.norm(scene[:, :2] - [kf_pose['x'], kf_pose['y']], axis=1)
     local_obs = scene[d <= 20]
     noisy = local_obs + np.random.default_rng(1).normal(0, 0.01, local_obs.shape)
-    obs = noisy @ t_sensor[:3, :3].T + t_sensor[:3, 3]
+    obs = np.dot(noisy, t_sensor[:3, :3].T) + t_sensor[:3, 3]
 
     entries = []
     for i, desc in enumerate(db['descriptors']):
@@ -153,8 +153,8 @@ def test_relocalization_recovers_known_transform(tmp_path):
     # it must be transformed into the CURRENT sensor frame before the
     # descriptor (P0 audit #6). inv(T_cameraInit_sensor) applied here.
     # inv(T) for a rigid transform: p_local = R^T @ (p_world - t)
-    obs_sensor = ((np.ascontiguousarray(obs, dtype=np.float64) - t_sensor[:3, 3])
-                  @ t_sensor[:3, :3])
+    obs_sensor = (np.dot(np.ascontiguousarray(obs, dtype=np.float64) - t_sensor[:3, 3],
+                          t_sensor[:3, :3]))
     query = make_descriptor_height(obs_sensor, sensor_z=0.0)
     top = sc_search(entries, query, topk=3)
     assert top[0][0]['index'] == 0, 'must retrieve the matching keyframe'

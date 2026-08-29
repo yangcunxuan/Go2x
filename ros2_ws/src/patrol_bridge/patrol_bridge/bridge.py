@@ -128,28 +128,37 @@ class Bridge(Node):
         self.create_timer(.25,self.tick); self.create_timer(.25,self.cloud_save_tick); self.create_timer(5.0,self.recovery_tick); self.create_timer(.05,self.teleop_tick); self.create_timer(.05,self.nav_watchdog); self.create_timer(.5,self.write_state)
         self.get_logger().info('Patrol bridge ready, runtime='+str(RUNTIME))
     def map_level_transform(self):
-        """4x4 map_level <- camera_init. Live TF first (localization mode),
-        env/static level transform as last resort (mapping mode before its
-        static TF is up, or legacy deployments)."""
+        """(4x4 matrix, source) for map_level <- camera_init. source is 'tf'
+        (live, from the localization manager or the mapping static TF) or
+        'env' (the fixed level transform, last resort). The caller resets its
+        jump-guard baseline when the source changes — a global relocalization
+        jump is legitimate, not odometry divergence (P0 audit #3)."""
         try:
             tf=self.tf_buffer.lookup_transform('map_level','camera_init',Time())
             tr=tf.transform
             matrix=np.eye(4,dtype=np.float64)
             matrix[:3,:3]=rotation_from_q(tr.rotation)
             matrix[:3,3]=[tr.translation.x,tr.translation.y,tr.translation.z]
-            return matrix
+            return matrix,'tf'
         except Exception:
             matrix=np.eye(4,dtype=np.float64)
             matrix[:3,:3]=self.cloud_level_rotation
             matrix[:3,3]=self.cloud_level_translation
-            return matrix
+            return matrix,'env'
+        
 
     def on_odom(self,msg):
         p=msg.pose.pose.position; q=msg.pose.pose.orientation
         raw_roll,raw_pitch,raw_yaw=rpy_from_q(q)
-        level_position=self.map_level_transform()@np.array([p.x,p.y,p.z,1.0],dtype=np.float64)
-        level_position=level_position[:3]
-        roll,pitch,yaw=rpy_from_rotation(self.cloud_level_rotation@rotation_from_q(q))
+        matrix,tf_source=self.map_level_transform()
+        if tf_source!=getattr(self,'_tf_source',''):
+            # First fix or a switch between env/static and live TF: the
+            # absolute pose legitimately jumps by the size of the global
+            # correction. Reset the guard baseline instead of latching.
+            self._tf_source=tf_source
+            self.last_level_sample=None
+        level_position=(matrix@np.array([p.x,p.y,p.z,1.0],dtype=np.float64))[:3]
+        roll,pitch,yaw=rpy_from_rotation(matrix[:3,:3]@rotation_from_q(q))
         display_yaw=math.atan2(math.sin(yaw+self.robot_yaw_offset),math.cos(yaw+self.robot_yaw_offset))
         sample_time=time.time()
         if self.last_level_sample is not None:
@@ -255,8 +264,8 @@ class Bridge(Node):
         except (ValueError,BufferError):return
         if not len(points):return
         if len(points)>4000:points=points[::math.ceil(len(points)/4000)]
-        points=(points @ self.map_level_transform()[:3,:3].T
-                + self.map_level_transform()[:3,3])
+        matrix=self.map_level_transform()
+        points=np.dot(points, matrix[:3,:3].T) + matrix[:3,3]
         now=time.monotonic()
         self.scan_window.append((now,points))
         while self.scan_window and now-self.scan_window[0][0]>self.scan_window_seconds:

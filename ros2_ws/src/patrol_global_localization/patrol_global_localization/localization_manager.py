@@ -100,47 +100,6 @@ def voxel_downsample(points, voxel):
     return points[np.sort(index)]
 
 
-def evaluate_registration(target, transformed, cell=0.3):
-    """Self-computed quality metrics (small_gicp version-independent).
-
-    fitness: fraction of transformed source points whose containing voxel is
-    occupied by the target.
-    rmse: RMS distance from transformed source points to the nearest occupied
-    target voxel center, evaluated only over the 27 neighboring cells of each
-    point (O(K x 27), no full-map scan).
-    """
-    if not len(target) or not len(transformed):
-        return 0.0, 1e3
-    t_keys = np.floor(target[:, :3] / cell).astype(np.int64)
-    s_keys = np.floor(transformed[:, :3] / cell).astype(np.int64)
-    occupied = {tuple(k): None for k in np.unique(t_keys, axis=0)}
-    if not occupied:
-        return 0.0, 1e3
-    offsets = [(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1)
-               for k in (-1, 0, 1)]
-    hits = 0
-    sq = []
-    sample_stride = max(1, len(transformed) // 2000)
-    for idx in range(0, len(transformed), sample_stride):
-        p = transformed[idx]
-        key = tuple(s_keys[idx])
-        if key in occupied:
-            hits += 1
-        best2 = None
-        for off in offsets:
-            nk = (key[0] + off[0], key[1] + off[1], key[2] + off[2])
-            if nk in occupied:
-                center = (np.array(nk) + 0.5) * cell
-                d2 = float(np.sum((center - p) ** 2))
-                if best2 is None or d2 < best2:
-                    best2 = d2
-        if best2 is not None and best2 <= 1.0:
-            sq.append(best2)
-    fitness = hits / len(transformed) if len(transformed) else 0.0
-    rmse = math.sqrt(sum(sq) / len(sq)) if sq else 1e3
-    return fitness, rmse
-
-
 class Registration:
     """small_gicp backend (mandatory dependency, no silent fallback)."""
 
@@ -160,10 +119,17 @@ class Registration:
             max_correspondence_distance=max_corr,
             num_threads=2)
         t = np.asarray(result.T_target_source, dtype=np.float64)
-        transformed = source @ t[:3, :3].T + t[:3, 3]
-        fitness, rmse = evaluate_registration(target, transformed)
         num_inliers = int(getattr(result, 'num_inliers', 0))
         converged = bool(getattr(result, 'converged', False))
+        # Exact NN distances of every transformed source point against the
+        # target cloud; small_gicp returns SQUARED distances (P0 audit #1:
+        # fitness and rmse share the same full-cloud basis).
+        transformed = np.dot(source, t[:3, :3].T) + t[:3, 3]
+        tree = small_gicp.build_kdtree(target)
+        d2, _ = small_gicp.nearest_neighbor_search(transformed, tree)
+        inlier = d2 <= (0.5 ** 2)
+        fitness = float(inlier.mean()) if len(d2) else 0.0
+        rmse = math.sqrt(float(d2[inlier].mean())) if inlier.any() else 1e3
         return {'T': t, 'converged': converged, 'num_inliers': num_inliers,
                 'fitness': fitness, 'rmse': rmse,
                 'quality_ok': (converged and fitness >= OVERLAP_MIN
@@ -267,8 +233,8 @@ class LocalizationManager(Node):
     def sensor_frame(self, points):
         """camera_init world points -> current sensor frame (P0 audit #6)."""
         inv = np.linalg.inv(self.t_cam_sensor)
-        return (np.ascontiguousarray(points, dtype=np.float64)
-                @ inv[:3, :3].T + inv[:3, 3])
+        return (np.dot(np.ascontiguousarray(points, dtype=np.float64),
+                       inv[:3, :3].T) + inv[:3, 3])
 
     # ---------- cycle ----------
     def tick(self):
