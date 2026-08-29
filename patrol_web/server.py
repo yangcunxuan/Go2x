@@ -265,6 +265,19 @@ def save_cloud_map(name):
                 response["nav_error"] = (projection.stderr or projection.stdout or "导航层生成失败")[-500:]
             else:
                 response["nav_map"] = json.loads(projection.stdout.strip().splitlines()[-1])
+            # Plan A: build the Scan Context keyframe database from the saved
+            # PCD + the trajectory recorded during mapping. Non-fatal: a map
+            # without a DB simply cannot be used for global relocalization.
+            db_command = ["docker-compose", "run", "--rm", "ros2", "bash", "-c",
+                          "PYTHONPATH=/project/ros2_ws/src/patrol_global_localization "
+                          "python3 -m patrol_global_localization.build_map_db "
+                          f"{safe} {response['pcd']} "
+                          f"/project/runtime/trajectory_{session.get('id','')[:8]}.json"]
+            db_run = subprocess.run(db_command, cwd=PROJECT, capture_output=True,
+                                    text=True, timeout=300)
+            if db_run.returncode:
+                response["db_error"] = (db_run.stderr or db_run.stdout or
+                                        "关键帧数据库生成失败")[-300:]
             session = read_json(MAPPING_SESSION_FILE, {})
             meta = {"name": safe, "session_id": session.get("id"), "session_started_at": session.get("started_at"),
                     "saved_at": time.time(), "coordinate_frame": "map_level"}
@@ -751,7 +764,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(200, {"config": config(), "robot": robot_state(), "c12": c12_status(),
                                      "go2": go2_state(),
                                      "services": service_status(), "task_run": dict(TASK_RUN),
-                                     "teleop": dict(TELEOP), "mapping_session": mapping_session(),
+                                     "teleop": dict(TELEOP), "mapping_session": mapping_session(), "localization": read_json(RUNTIME / "localization_state.json", {}),
                                      "mapping_recovery": read_json(MAPPING_RECOVERY_FILE, {})})
         elif path == "/api/checkpoints":
             self.json_response(200, read_json(CHECKPOINTS_FILE, []))

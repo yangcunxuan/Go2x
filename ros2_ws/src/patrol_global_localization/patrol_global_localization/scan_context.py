@@ -66,7 +66,9 @@ def ring_key(sc):
 
 
 def distance(sc1, sc2):
-    """Sector-shift-invariant distance in [0, 1]: search all column shifts."""
+    """Sector-shift-invariant distance in [0, 1]: search all column shifts.
+    Descriptor cells are uint8 (0..255), so the mean absolute difference is
+    normalized by 255."""
     if sc1.size == 0 or sc2.size == 0:
         return 1.0
     num_sectors = sc1.shape[1]
@@ -76,7 +78,7 @@ def distance(sc1, sc2):
         cand = np.roll(sc2, shift, axis=1)
         diff = np.abs(sc1.astype(np.float32) - cand.astype(np.float32))
         valid = (sc1 > 0) | (cand > 0)
-        d = float(diff[valid].mean()) if valid.any() else 1.0
+        d = float(diff[valid].mean()) / 255.0 if valid.any() else 1.0
         if d < best:
             best = d
             best_shift = shift

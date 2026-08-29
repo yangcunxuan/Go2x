@@ -219,6 +219,23 @@ class PlannerMotionBridge(Node):
         # freshness (last_plan, checked in enabled()) is the real gate.
         self.path_start_ok = bool(points)
 
+    def localization_ready(self):
+        """Plan A hard gate: GO2 motion requires the global localization
+        manager to report LOCALIZED from a fresh state file. If the file is
+        entirely absent (localizer not deployed yet) this degrades to a
+        warning so the legacy setup keeps working."""
+        path = Path("/project/runtime/localization_state.json")
+        try:
+            loc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.get_logger().warn("localization_state.json 缺失，运动门禁未启用",
+                                   throttle_duration_sec=30.0)
+            return True
+        if time.time() - float(loc.get("updated_at", 0)) > 5.0:
+            self.get_logger().error("定位状态过期，禁止运动", throttle_duration_sec=5.0)
+            return False
+        return bool(loc.get("state") == "LOCALIZED" and loc.get("ok_for_navigation"))
+
     def enabled(self):
         try:
             state = json.loads(ENABLE_FILE.read_text(encoding="utf-8"))
@@ -232,6 +249,8 @@ class PlannerMotionBridge(Node):
             # planner stack has no Nav2, so gate on sane localization instead.
             sane = robot.get("localization_sane") is not False
             route_valid = self.path_start_ok and time.monotonic() - self.last_plan < 3.0
+            if not self.localization_ready():
+                return False
             return (bool(state.get("enabled")) and time.time() < float(state.get("expires_at", 0))
                     and fresh and cool and standing and sane and route_valid)
         except (OSError, ValueError, TypeError):

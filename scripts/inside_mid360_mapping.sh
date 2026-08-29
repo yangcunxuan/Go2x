@@ -17,11 +17,19 @@ RVIZ=false /project/scripts/run_mapping.sh > /project/runtime/logs/fastlio.log 2
 sleep 5
 # Level the FAST-LIO initial frame for the current mechanically tilted MID360.
 # Recalibrate these angles if the sensor mount changes.
-ros2 run tf2_ros static_transform_publisher \
-  --x "$MAP_LEVEL_X" --y "$MAP_LEVEL_Y" --z "$MAP_LEVEL_Z" \
-  --roll -0.030788 --pitch 0.621767 --yaw "$MAP_LEVEL_YAW" \
-  --frame-id map_level --child-frame-id camera_init \
-  > /project/runtime/logs/mid360_level_tf.log 2>&1 & PIDS+=($!); NAMES+=(level_tf)
+# Plan A localization mode: when a Scan Context database exists, the global
+# localization manager owns the dynamic map_level -> camera_init TF and the
+# static alignment TF must stay off (two publishers would fight).
+LOC_DB=$(find /project/patrol_data/maps -name db.npz 2>/dev/null | head -1 || true)
+if [ -n "$LOC_DB" ]; then
+  echo "载图定位模式: $LOC_DB （静态 map_level TF 关闭）"
+else
+  ros2 run tf2_ros static_transform_publisher \
+    --x "$MAP_LEVEL_X" --y "$MAP_LEVEL_Y" --z "$MAP_LEVEL_Z" \
+    --roll -0.030788 --pitch 0.621767 --yaw "$MAP_LEVEL_YAW" \
+    --frame-id map_level --child-frame-id camera_init \
+    > /project/runtime/logs/mid360_level_tf.log 2>&1 & PIDS+=($!); NAMES+=(level_tf)
+fi
 # Three-dimensional mapping mode deliberately does not start
 # pointcloud_to_laserscan or slam_toolbox. Those 2-D nodes belong to the
 # navigation preparation path, not the MID360 FAST-LIO mapping session.
@@ -41,6 +49,12 @@ MAPPING_SESSION_ID=$(python3 -c 'import json
 try: print(json.load(open("/project/runtime/mapping_session.json")).get("id","unknown"))[:8]
 except Exception: print("unknown")')
 PYTHONPATH=/project/ros2_ws/src/patrol_global_localization python3 -m patrol_global_localization.keyframe_saver >> /project/runtime/logs/keyframe_saver.log 2>&1 & PIDS+=($!); NAMES+=(keyframe_saver)
+# Global localization (Plan A): only meaningful with a map database.
+if [ -n "$LOC_DB" ]; then
+  PYTHONPATH=/project/ros2_ws/src/patrol_global_localization \
+    python3 -m patrol_global_localization.localization_manager \
+    >> /project/runtime/logs/localization_manager.log 2>&1 & PIDS+=($!); NAMES+=(localization_manager)
+fi
 CLOUD_MAP_TOPIC=/__disabled ODOM_TOPIC=/Odometry ros2 run patrol_bridge bridge > /project/runtime/logs/patrol_bridge.log 2>&1 & PIDS+=($!); NAMES+=(patrol_bridge)
 mkdir -p /project/runtime/cloud_bridge
 PATROL_RUNTIME=/project/runtime/cloud_bridge ODOM_TOPIC=/__disabled \
