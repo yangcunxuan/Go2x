@@ -157,6 +157,11 @@ class Bridge(Node):
             # correction. Reset the guard baseline instead of latching.
             self._tf_source=tf_source
             self.last_level_sample=None
+        if tf_source=='tf':
+            # With live TF the localizer owns correctness (it gates itself
+            # via LOST/AMBIGUOUS and blocks motion); odometry-vs-TF jumps here
+            # are legal global corrections, never FAST-LIO divergence.
+            self.last_level_sample=None
         level_position=(matrix@np.array([p.x,p.y,p.z,1.0],dtype=np.float64))[:3]
         roll,pitch,yaw=rpy_from_rotation(matrix[:3,:3]@rotation_from_q(q))
         display_yaw=math.atan2(math.sin(yaw+self.robot_yaw_offset),math.cos(yaw+self.robot_yaw_offset))
@@ -264,7 +269,7 @@ class Bridge(Node):
         except (ValueError,BufferError):return
         if not len(points):return
         if len(points)>4000:points=points[::math.ceil(len(points)/4000)]
-        matrix=self.map_level_transform()
+        matrix,_=self.map_level_transform()
         points=np.dot(points, matrix[:3,:3].T) + matrix[:3,3]
         now=time.monotonic()
         self.scan_window.append((now,points))

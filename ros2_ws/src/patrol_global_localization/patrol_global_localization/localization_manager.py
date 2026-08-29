@@ -122,11 +122,12 @@ class Registration:
         num_inliers = int(getattr(result, 'num_inliers', 0))
         converged = bool(getattr(result, 'converged', False))
         # Exact NN distances of every transformed source point against the
-        # target cloud; small_gicp returns SQUARED distances (P0 audit #1:
-        # fitness and rmse share the same full-cloud basis).
+        # target cloud; small_gicp returns (indices, SQUARED distances)
+        # (P0 audit #1: fitness and rmse share the same full-cloud basis).
         transformed = np.dot(source, t[:3, :3].T) + t[:3, 3]
-        tree = small_gicp.build_kdtree(target)
-        d2, _ = small_gicp.nearest_neighbor_search(transformed, tree)
+        tree = small_gicp.KdTree(small_gicp.PointCloud(target))
+        indices, d2 = tree.batch_nearest_neighbor_search(transformed, num_threads=2)
+        d2 = np.asarray(d2, dtype=np.float64)
         inlier = d2 <= (0.5 ** 2)
         fitness = float(inlier.mean()) if len(d2) else 0.0
         rmse = math.sqrt(float(d2[inlier].mean())) if inlier.any() else 1e3

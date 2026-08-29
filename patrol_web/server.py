@@ -539,6 +539,12 @@ def set_nav_motion(enabled, reason=""):
     return state
 
 
+def active_map_id():
+    """The single authority for "which map is active": active_map.json.
+    Never derive the id from a YAML/PCD file name (P0 audit #2/#4)."""
+    return read_json(ACTIVE_MAP_FILE, {}).get("name")
+
+
 def latest_nav_map():
     """2D nav grid (YAML) of the active map. Package layout first
     (maps/<map_id>/map.yaml), then the legacy flat layout."""
@@ -801,16 +807,14 @@ def execute_steps(run_id, task):
                 # Same hard gate as the manual goal endpoint (P0 audit #5):
                 # LOCALIZED + map binding, or the task must not move the dog.
                 loc = read_json(RUNTIME / "localization_state.json", {})
-                active = latest_nav_map()
-                active_map_id = active.parent.name if (active and active.parent.name != "maps") \
-                    else (active.stem if active else None)
+                active_mid = active_map_id()
                 if time.time() - float(loc.get("updated_at", 0)) > 2.0 \
                         or loc.get("state") != "LOCALIZED" \
                         or not loc.get("ok_for_navigation"):
                     raise RuntimeError("全局定位未就绪（未LOCALIZED），任务无法导航")
-                if loc.get("map_id") != active_map_id:
+                if loc.get("map_id") != active_mid:
                     raise RuntimeError("定位地图与活动地图不一致，任务无法导航")
-                if checkpoint.get("map_name") not in (None, active_map_id):
+                if checkpoint.get("map_name") not in (None, active_mid):
                     raise RuntimeError(f"巡查点属于地图{checkpoint.get('map_name')}，与活动地图不一致")
                 goal = issue_goal(checkpoint)
                 set_nav_motion(True, "任务导航：" + checkpoint["name"])
@@ -1088,9 +1092,9 @@ class Handler(BaseHTTPRequestHandler):
                     # (The old mapping-running requirement left points picked
                     # between sessions untagged and invisible everywhere.)
                     point["session_id"] = session.get("id")
-                    active = latest_nav_map()
-                    active_meta = read_json(active.with_suffix(".meta.json"), {}) if active else {}
-                    point["map_name"] = active.stem if session.get("running") and active and active_meta.get("session_id") == session.get("id") else "__live__"
+                    active_mid = active_map_id()
+                    active_meta = read_json(DATA / "maps" / active_mid / "metadata.json", {}) if active_mid else {}
+                    point["map_name"] = active_mid if session.get("running") and active_mid and active_meta.get("session_id") == session.get("id") else "__live__"
                 points.append(point); write_json(CHECKPOINTS_FILE, points); self.json_response(200, point)
             elif path == "/api/checkpoints/delete":
                 points = read_json(CHECKPOINTS_FILE, [])
@@ -1140,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                         or loc.get("state") != "LOCALIZED" \
                         or not loc.get("ok_for_navigation"):
                     raise ValueError("全局定位未就绪（未LOCALIZED），禁止下发目标")
-                if active and loc.get("map_id") != active.stem:
+                if active_mid and loc.get("map_id") != active_mid:
                     raise ValueError("定位所在的地图与活动地图不一致，禁止下发目标")
                 baseline = int(go2_state().get("nav_relay", {}).get("publish_count", 0) or 0)
                 set_nav_motion(True, "导航到：" + point["name"])

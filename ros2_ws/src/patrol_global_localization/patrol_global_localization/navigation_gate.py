@@ -44,10 +44,12 @@ def navigation_gate(loc_state, active_map_id, now=None,
         return False, f"定位状态非LOCALIZED: {loc_state.get('state')}"
     if not loc_state.get("ok_for_navigation"):
         return False, "ok_for_navigation=false"
-    if require_map_binding and active_map_id and \
-            loc_state.get("map_id") != active_map_id:
-        return False, (f"定位地图({loc_state.get('map_id')})与"
-                       f"活动地图({active_map_id})不一致")
+    if require_map_binding:
+        if not active_map_id:
+            return False, "活动地图缺失，无法绑定定位"
+        if loc_state.get("map_id") != active_map_id:
+            return False, (f"定位地图({loc_state.get('map_id')})与"
+                           f"活动地图({active_map_id})不一致")
     return True, "LOCALIZED"
 
 

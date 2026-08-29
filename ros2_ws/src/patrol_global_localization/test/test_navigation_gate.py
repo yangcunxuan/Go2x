@@ -42,6 +42,12 @@ def test_gate_map_id_mismatch_blocks():
     assert not allowed and '不一致' in reason
 
 
+def test_gate_missing_active_map_blocks():
+    """Fail-closed: without an active map the localization cannot be bound."""
+    allowed, reason = navigation_gate(loc_state(), None, now=NOW)
+    assert not allowed and '活动地图缺失' in reason
+
+
 def test_gate_ok_passes():
     allowed, _ = navigation_gate(loc_state(), 'factory_a', now=NOW)
     assert allowed
