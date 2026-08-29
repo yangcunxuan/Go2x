@@ -7,6 +7,8 @@ import mimetypes
 import os
 import signal
 import struct
+import sys
+
 
 import numpy as np
 import subprocess
@@ -20,6 +22,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 PROJECT = Path(os.environ.get("PATROL_PROJECT", ROOT.parent))
+
+sys.path.insert(0, str(PROJECT / "ros2_ws" / "src" / "patrol_global_localization"))
+from patrol_global_localization.navigation_gate import map_binding_violation
 DATA = Path(os.environ.get("PATROL_DATA", PROJECT / "patrol_data"))
 RUNTIME = Path(os.environ.get("PATROL_RUNTIME", PROJECT / "runtime"))
 CLOUD_RUNTIME = Path(os.environ.get("PATROL_CLOUD_RUNTIME", RUNTIME / "cloud_bridge"))
@@ -311,8 +316,10 @@ def save_cloud_map(name):
                     localization_ready = False
             if not localization_ready:
                 response["db_error"] = (db_run.stderr or db_run.stdout or "关键帧数据库生成失败")[-300:]
+        coord_version = uuid.uuid4().hex[:12]
         metadata = {
             "map_id": map_id,
+            "coord_version": coord_version,
             "frame": "map_level",
             "pcd": "map.pcd",
             "numpy_map": "map.npy" if (staging / "map.npy").is_file() else None,
@@ -345,13 +352,23 @@ def save_cloud_map(name):
             shutil.rmtree(backup, ignore_errors=True)
         # Bind checkpoints created during this session to the map.
         points_list = read_json(CHECKPOINTS_FILE, [])
-        changed = False
+        kept = []
+        removed_old = 0
         for point in points_list:
             if session_id and point.get("session_id") == session_id:
                 point["map_name"] = map_id
-                changed = True
-        if changed:
-            write_json(CHECKPOINTS_FILE, points_list)
+                point["coord_version"] = coord_version
+                kept.append(point)
+            elif point.get("map_name") == map_id:
+                if point.get("coord_version") == coord_version:
+                    kept.append(point)
+                else:
+                    removed_old += 1  # stale coordinates from the overwritten map
+            else:
+                kept.append(point)
+        if removed_old:
+            response["removed_stale_checkpoints"] = removed_old
+        write_json(CHECKPOINTS_FILE, kept)
         # Only a localization-ready map becomes the ACTIVE navigation map;
         # an incomplete package stays viewable but cannot be navigated to.
         if localization_ready:
@@ -824,8 +841,13 @@ def execute_steps(run_id, task):
                     raise RuntimeError("全局定位未就绪（未LOCALIZED），任务无法导航")
                 if loc.get("map_id") != active_mid:
                     raise RuntimeError("定位地图与活动地图不一致，任务无法导航")
-                if checkpoint.get("map_name") not in (None, active_mid):
+                if checkpoint.get("map_name") != active_mid:
                     raise RuntimeError(f"巡查点属于地图{checkpoint.get('map_name')}，与活动地图不一致")
+                binding_error = map_binding_violation(
+                    checkpoint, active_mid,
+                    read_json(DATA / "maps" / active_mid / "metadata.json", {}) if active_mid else {})
+                if binding_error:
+                    raise RuntimeError(binding_error)
                 goal = issue_goal(checkpoint)
                 set_nav_motion(True, "任务导航：" + checkpoint["name"])
                 deadline = time.time() + min(600, max(10, int(step.get("timeout", 120))))
@@ -1112,6 +1134,9 @@ class Handler(BaseHTTPRequestHandler):
                         # so a point can never be navigated with another
                         # map's coordinates.
                         point["map_name"] = active_mid
+                        point["coord_version"] = (read_json(
+                            DATA / "maps" / active_mid / "metadata.json",
+                            {}).get("coord_version"))
                         point["session_id"] = session.get("id")
                     elif session.get("running") and session.get("id"):
                         # Mapping mode: draft bound to the live session.
@@ -1151,8 +1176,9 @@ class Handler(BaseHTTPRequestHandler):
                 session_ok = (point.get("map_name") == "__live__" and
                               point.get("session_id") == mapping_session().get("id") and
                               service_status().get("mapping", {}).get("running"))
-                if point.get("map_name") != active_name and not session_ok:
-                    raise ValueError("该巡查点不属于当前活动地图或本次实时会话，请重新选择")
+                binding_error = map_binding_violation(point, active_name, packaged_meta)
+                if binding_error and not session_ok:
+                    raise ValueError(binding_error + "，或本次实时会话不匹配，请重新选点")
                 current_pose = robot_state().get("pose", {})
                 if active_name:
                     # 2-D grid checks only exist for a saved navigation map;
@@ -1228,6 +1254,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown); signal.signal(signal.SIGINT, shutdown)
     try: start_service("go2_state", "run_go2_state_bridge.sh")
     except Exception as exc: print("GO2 state bridge start failed:", exc, flush=True)
+    recover_map_dirs()  # crash recovery for map overwrites (P1 audit)
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer((HOST, PORT), Handler); server.daemon_threads = True
     print(f"Patrol console: http://{HOST}:{PORT}", flush=True)

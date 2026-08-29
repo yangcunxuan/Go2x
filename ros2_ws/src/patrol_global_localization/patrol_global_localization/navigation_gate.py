@@ -53,6 +53,21 @@ def navigation_gate(loc_state, active_map_id, now=None,
     return True, "LOCALIZED"
 
 
+def map_binding_violation(point, active_map_id_value, metadata=None):
+    """Returns an error string if the checkpoint cannot be navigated under
+    the current active map, else None. Checks the map binding AND the
+    coordinate version: a rebuilt map (same name, new map_level origin)
+    invalidates points recorded under the previous version (P0 audit)."""
+    if point.get("map_name") != active_map_id_value:
+        return "该巡查点不属于当前活动地图"
+    if metadata is None and active_map_id_value:
+        return None  # caller had no metadata; binding check only
+    cv = (metadata or {}).get("coord_version")
+    if cv and point.get("coord_version") != cv:
+        return "巡查点坐标版本与当前地图不一致（地图已重建），请重新选点"
+    return None
+
+
 def cluster_hypotheses(scored, pos_tol=1.0, yaw_tol=math.radians(10.0)):
     """Group registration hypotheses by final pose (position + yaw).
 
