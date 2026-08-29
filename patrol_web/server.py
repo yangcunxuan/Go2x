@@ -406,17 +406,9 @@ def robot_state():
     # failure even when it accumulated too slowly for the per-frame jump guard.
     alignment = read_json(RUNTIME / "localization_alignment.json", {})
     go2_for_height = read_json(GO2_STATE_FILE, {})
-    # The alignment-file height cross-check is only meaningful in MAPPING
-    # mode (fixed leveling TF). In localization mode the dynamic TF owns the
-    # map_level height and a stale alignment z would false-positive.
-    if (sane and "z" in alignment
-            and service_status().get("mapping", {}).get("running")
-            and time.time() - float(go2_for_height.get("updated_at", 0)) < 2):
-        reference_height = float(alignment.get("reference_body_height", 0.07))
-        expected_z = float(alignment["z"]) + float(go2_for_height.get("body_height", reference_height)) - reference_height
-        if abs(values[2] - expected_z) > 0.45:
-            sane = False
-            state["localization_error"] = f"FAST-LIO高度与GO2机身高度不一致：定位z={values[2]:.2f}m，预期约{expected_z:.2f}m"
+    # (The old alignment-file height cross-check was removed: in mapping mode
+    # the TF is identity-anchored and in localization mode the dynamic TF owns
+    # map_level height — a stale alignment z only produced false positives.)
     state["localization_sane"] = sane
     state["localization_error"] = None if sane else (state.get("localization_error") or "FAST-LIO位姿超出安全范围，疑似定位发散")
     state["online"] = bool(state["bridge_online"] and state.get("odom_online", False) and sane)
@@ -1108,8 +1100,11 @@ class Handler(BaseHTTPRequestHandler):
                         # map's coordinates.
                         point["map_name"] = active_mid
                         point["session_id"] = session.get("id")
-                    elif session.get("running") and active_mid:
+                    elif session.get("running") and session.get("id"):
                         # Mapping mode: draft bound to the live session.
+                        # The FIRST-EVER mapping session has no active map
+                        # yet — requiring active_mid here left those drafts
+                        # unbound and unnavigable (P0 audit).
                         point["map_name"] = "__live__"
                         point["session_id"] = session.get("id")
                 points.append(point); write_json(CHECKPOINTS_FILE, points); self.json_response(200, point)
