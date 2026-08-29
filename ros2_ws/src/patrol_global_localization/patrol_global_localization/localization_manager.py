@@ -78,9 +78,9 @@ CLUSTER_POS = 1.0
 CLUSTER_YAW = math.radians(10.0)
 
 
-def angle_diff(a, b):
-    """Absolute angular difference with wraparound (P0 audit: +/-180 deg)."""
-    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+from patrol_global_localization.navigation_gate import (
+    angle_diff, cluster_hypotheses, track_update, uniqueness_decision,
+    verify_consistent)
 
 
 def yaw_of(t):
@@ -344,29 +344,15 @@ class LocalizationManager(Node):
         if not scored:
             self.set_state('SEARCHING', '所有候选配准失败')
             return
-        # Cluster hypotheses: position <1.0 m and yaw <10 deg merge.
-        clusters = []
-        for cand in sorted(scored, key=lambda c: -c['fitness']):
-            for cluster in clusters:
-                head = cluster[0]
-                if (math.hypot(cand['x'] - head['x'], cand['y'] - head['y']) < CLUSTER_POS
-                        and angle_diff(cand['yaw'], head['yaw']) < CLUSTER_YAW
-                        and cand['map'] == head['map']):
-                    cluster.append(cand)
-                    break
-            else:
-                clusters.append([cand])
-        clusters.sort(key=lambda c: -max(member['fitness'] for member in c))
-        best_cluster = clusters[0]
-        best = max(best_cluster, key=lambda c: c['fitness'])
-        if len(clusters) > 1:
-            second_best = max(clusters[1], key=lambda c: c['fitness'])
-            margin = best['fitness'] - second_best['fitness']
-            if margin < UNIQUE_MARGIN:
-                self.set_state('AMBIGUOUS',
-                               f'两个位置假设质量接近(边距{margin:.2f})，禁止导航')
-                return
-        self.last_margin = margin if len(clusters) > 1 else None
+        # Cluster hypotheses: position <1.0 m and yaw <10 deg merge; different
+        # clusters with close quality = AMBIGUOUS (never guess).
+        clusters = cluster_hypotheses(scored, CLUSTER_POS, CLUSTER_YAW)
+        best, ambiguous, margin = uniqueness_decision(clusters, UNIQUE_MARGIN)
+        if ambiguous:
+            self.set_state('AMBIGUOUS',
+                           f'两个位置假设质量接近(边距{margin})，禁止导航')
+            return
+        self.last_margin = margin
         if not best['quality_ok']:
             self.set_state('SEARCHING',
                            f"最佳候选质量不足(fitness={best['fitness']:.2f} "
@@ -386,10 +372,8 @@ class LocalizationManager(Node):
             self.set_state('SEARCHING', '验证帧质量不足，重新检索')
             return
         t = result['T']
-        consistent = all(
-            np.linalg.norm(t[:3, 3] - prev['T'][:3, 3]) <= VERIFY_POS_TOL
-            and angle_diff(yaw_of(t), yaw_of(prev['T'])) <= VERIFY_YAW_TOL
-            for prev in self.verify_results)
+        consistent = verify_consistent([prev['T'] for prev in self.verify_results],
+                                       t, VERIFY_POS_TOL, VERIFY_YAW_TOL)
         if not consistent:
             self.verify_results = [result]
             self.set_state('VERIFYING', '验证帧不一致，重新计数')
@@ -409,27 +393,20 @@ class LocalizationManager(Node):
 
     def do_track(self, window):
         result = self.align_one(self.map_id_est, window, self.t_map_cam)
-        if result is None or not result['quality_ok']:
-            self.degraded_count += 3
-        else:
-            t = result['T']
-            jump = float(np.linalg.norm(t[:3, 3] - self.t_map_cam[:3, 3]))
-            jump_yaw = angle_diff(yaw_of(t), yaw_of(self.t_map_cam))
-            if jump > LOST_CORRECT_MAX or jump_yaw > math.radians(20):
-                self.set_state('LOST', f'修正量异常({jump:.2f}m)，重新全局检索')
-                self.degraded_count = 0
-                self.t_map_cam = None
-                return
-            self.t_map_cam = t
+        jump = jump_yaw = 0.0
+        if result is not None:
+            jump = float(np.linalg.norm(result['T'][:3, 3] - self.t_map_cam[:3, 3]))
+            jump_yaw = angle_diff(yaw_of(result['T']), yaw_of(self.t_map_cam))
+        result_ok = bool(result and result['quality_ok'])
+        self.degraded_count, lost = track_update(
+            self.degraded_count, result_ok, jump, jump_yaw,
+            CORRECT_MAX, CORRECT_YAW_MAX, LOST_CORRECT_MAX)
+        if not lost and result is not None and result['quality_ok']:
+            self.t_map_cam = result['T']
             self.last_rmse = result['rmse']
             self.last_fitness = result['fitness']
-            if (jump > CORRECT_MAX or jump_yaw > CORRECT_YAW_MAX):
-                self.degraded_count += 1
-            else:
-                self.degraded_count = 0
-        if self.degraded_count >= 6:
-            self.set_state('LOST', '连续匹配失败，重新全局检索')
-            self.degraded_count = 0
+        if lost:
+            self.set_state('LOST', '匹配失败或修正量异常，重新全局检索')
             self.t_map_cam = None
         elif self.degraded_count >= 3:
             self.set_state('DEGRADED', '匹配质量下降')

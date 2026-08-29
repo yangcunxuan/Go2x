@@ -26,8 +26,12 @@ that accepts pure yaw).
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, "/project/ros2_ws/src/patrol_global_localization")
+from patrol_global_localization.navigation_gate import navigation_gate
 
 import numpy as np
 
