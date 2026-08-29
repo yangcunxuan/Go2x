@@ -33,6 +33,10 @@ def test_unbound_point_blocks():
     assert err
 
 
-def test_none_metadata_falls_back_to_binding_only():
-    point = {'map_name': 'factory_a', 'coord_version': 'whatever'}
-    assert map_binding_violation(point, 'factory_a', None) is None
+def test_none_metadata_blocks_legacy_map():
+    """Fail-closed: legacy maps without coord_version need one re-save."""
+    err = map_binding_violation({'map_name': 'factory_a'}, 'factory_a', None)
+    assert err and '旧格式' in err
+    err = map_binding_violation({'map_name': 'factory_a', 'coord_version': 'whatever'},
+                                'factory_a', None)
+    assert err and '旧格式' in err

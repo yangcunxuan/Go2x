@@ -564,6 +564,25 @@ def set_nav_motion(enabled, reason=""):
     return state
 
 
+def recover_map_dirs():
+    """Startup recovery for a crash between the two renames of a map
+    overwrite: restore .old_* backups whose final directory is missing and
+    remove leftover .staging_* dirs. Called once from the server startup
+    path (P0 audit: the call site must never reference a missing function)."""
+    maps_dir = DATA / "maps"
+    if not maps_dir.is_dir():
+        return
+    for backup in maps_dir.glob(".old_*"):
+        map_id = backup.name[len(".old_"):].rsplit("_", 1)[0]
+        final = maps_dir / map_id
+        if final.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            os.replace(backup, final)
+    for staging in maps_dir.glob(".staging_*"):
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def active_map_id():
     """The single authority for "which map is active": active_map.json.
     Never derive the id from a YAML/PCD file name (P0 audit #2/#4)."""

@@ -60,10 +60,13 @@ def map_binding_violation(point, active_map_id_value, metadata=None):
     invalidates points recorded under the previous version (P0 audit)."""
     if point.get("map_name") != active_map_id_value:
         return "该巡查点不属于当前活动地图"
-    if metadata is None and active_map_id_value:
-        return None  # caller had no metadata; binding check only
+    # Fail-closed on coordinate version: metadata without a coord_version is
+    # a legacy map — it must be re-saved once to migrate before its points
+    # can be navigated.
     cv = (metadata or {}).get("coord_version")
-    if cv and point.get("coord_version") != cv:
+    if not cv:
+        return "地图缺少坐标版本(旧格式)，请重新保存地图以迁移"
+    if point.get("coord_version") != cv:
         return "巡查点坐标版本与当前地图不一致（地图已重建），请重新选点"
     return None
 
