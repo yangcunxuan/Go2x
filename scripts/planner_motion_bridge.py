@@ -63,6 +63,28 @@ FRONT_HALF_ANGLE_DEG = float(os.environ.get("FRONT_HALF_ANGLE_DEG", "35.0"))
 # slightly lower threshold so real obstacles trip before the max.
 OBSTACLE_INTENSITY = float(os.environ.get("TERRAIN_OBSTACLE_INTENSITY", "0.36"))
 TERRAIN_MAX_AGE = float(os.environ.get("TERRAIN_MAX_AGE", "1.5"))
+
+
+def quat_matrix_from_odom(q):
+    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) or 1.0
+    qx, qy, qz, qw = q.x / n, q.y / n, q.z / n, q.w / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def tf_buffer_lookup(buffer, target, source):
+    """Latest TF as a 4x4 matrix; raises if the transform is unavailable."""
+    m = buffer.lookup_transform(target, source, Time())
+    tr = m.transform
+    matrix = np.eye(4)
+    matrix[:3, :3] = quat_matrix_from_odom(tr.rotation)
+    matrix[:3, 3] = [tr.translation.x, tr.translation.y, tr.translation.z]
+    return matrix
+
+
 def twist_fields(cloud, odom):
     """Return (front_min, left_min, right_min) obstacle distance in body frame.
 
@@ -339,22 +361,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-def quat_matrix_from_odom(q):
-    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) or 1.0
-    qx, qy, qz, qw = q.x / n, q.y / n, q.z / n, q.w / n
-    return np.array([
-        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
-        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
-    ], dtype=np.float64)
-
-
-def tf_buffer_lookup(buffer, target, source):
-    """Latest TF as a 4x4 matrix; raises if the transform is unavailable."""
-    m = buffer.lookup_transform(target, source, Time())
-    tr = m.transform
-    matrix = np.eye(4)
-    matrix[:3, :3] = quat_matrix_from_odom(tr.rotation)
-    matrix[:3, 3] = [tr.translation.x, tr.translation.y, tr.translation.z]
-    return matrix

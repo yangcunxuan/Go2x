@@ -12,11 +12,18 @@ trap cleanup EXIT INT TERM
 
 docker-compose run --rm ros2 ./scripts/inside_mid360_localization.sh \
   >> runtime/logs/mid360_localization.log 2>&1 & PIDS+=($!)
+LOCALIZATION_PID=${PIDS[0]}
 
-python3 - <<'PYEOF'
-import json, sys, time
+python3 - "$LOCALIZATION_PID" <<'PYEOF'
+import json, os, sys, time
+pid = int(sys.argv[1])
 deadline = time.time() + 90
 while time.time() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        print('MID360定位栈在里程计就绪前退出', file=sys.stderr)
+        sys.exit(5)
     try:
         d = json.load(open('runtime/robot_state.json'))
         if time.time() - float(d['updated_at']) < 2 and d.get('odom_online'):
@@ -29,4 +36,12 @@ print('等待里程计超时', file=sys.stderr)
 sys.exit(4)
 PYEOF
 
-bash scripts/run_planner_stack.sh
+bash scripts/run_planner_stack.sh & PIDS+=($!)
+
+# Localization and planning are one service: either child exiting tears down
+# the other, so the web can never report navigation as running with a dead
+# localizer or motion bridge.
+set +e
+wait -n "${PIDS[@]}"; code=$?
+set -e
+exit "$code"

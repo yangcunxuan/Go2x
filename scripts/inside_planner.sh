@@ -24,16 +24,29 @@ if ! grep -Fxq /Odometry <<<"$TOPICS" || ! grep -Fxq /cloud_registered_body <<<"
 fi
 
 echo "启动 planner stack（mode=${MODE}）"
+PIDS=(); NAMES=()
+cleanup(){ kill -INT "${PIDS[@]}" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
 ros2 launch /project/config/planner_stack.launch.py mode:=${MODE} &
-LAUNCH_PID=$!
+LAUNCH_PID=$!; PIDS+=($LAUNCH_PID); NAMES+=(planner_launch)
 
 # far_planner silently drops every /goal_point until its /start_far_planner
 # Trigger service is called (is_system_started_). Call it automatically so
 # a container restart never leaves planning disabled.
 if [ "${MODE}" = "full" ]; then
-  python3 /project/scripts/start_far_service.py || echo '警告：far_planner 启动服务调用失败，目标点将被忽略' >&2
-  python3 /project/scripts/planner_motion_bridge.py >> /project/runtime/logs/motion_bridge.log 2>&1 &
-  python3 /project/scripts/goal_relay.py >> /project/runtime/logs/goal_relay.log 2>&1 &
+  # A failed FAR start is fatal: keeping a "running" navigation service that
+  # silently ignores every goal is misleading and impossible to diagnose.
+  python3 /project/scripts/start_far_service.py
+  python3 /project/scripts/planner_motion_bridge.py >> /project/runtime/logs/motion_bridge.log 2>&1 & PIDS+=($!); NAMES+=(motion_bridge)
+  python3 /project/scripts/goal_relay.py >> /project/runtime/logs/goal_relay.log 2>&1 & PIDS+=($!); NAMES+=(goal_relay)
 fi
 
-wait $LAUNCH_PID
+set +e
+wait -n "${PIDS[@]}"; code=$?
+set -e
+for index in "${!PIDS[@]}"; do
+  if ! kill -0 "${PIDS[$index]}" 2>/dev/null; then
+    echo "导航子进程退出：${NAMES[$index]}，退出码：$code" >&2
+  fi
+done
+exit "$code"

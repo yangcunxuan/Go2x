@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import os
+import shutil
 import signal
 import struct
 import sys
@@ -334,6 +335,16 @@ def save_cloud_map(name):
             "localization_ready": localization_ready,
         }
         write_json(staging / "metadata.json", metadata)
+        navigation_ready = localization_ready and nav_ok
+        requested_final = DATA / "maps" / map_id
+        if requested_final.exists() and not navigation_ready:
+            # Never destroy a usable map with an incomplete rebuild of the
+            # same display name. Keep the diagnostic package under a unique,
+            # visibly incomplete id while the committed map remains intact.
+            map_id = f"{map_id}_incomplete_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            metadata["map_id"] = map_id
+            write_json(staging / "metadata.json", metadata)
+            response["name"] = map_id
         # Atomic finalize: the package directory appears complete or not at
         # all. Overwrites move the old dir aside first (a crash between
         # rmtree and replace would otherwise destroy the previous map).
@@ -369,10 +380,13 @@ def save_cloud_map(name):
         if removed_old:
             response["removed_stale_checkpoints"] = removed_old
         write_json(CHECKPOINTS_FILE, kept)
-        # Only a localization-ready map becomes the ACTIVE navigation map;
-        # an incomplete package stays viewable but cannot be navigated to.
-        if localization_ready:
+        # A map needs BOTH its global-localization database and its own
+        # navigation grid before it can become active. Never let map A borrow
+        # map B's grid when projection failed.
+        if navigation_ready:
             write_json(ACTIVE_MAP_FILE, {"name": map_id, "updated_at": time.time()})
+        elif active_map_id() == map_id:
+            write_json(ACTIVE_MAP_FILE, {})
         response["map_id"] = map_id
         response["localization_ready"] = localization_ready
         response["session_id"] = session_id
@@ -567,8 +581,9 @@ def set_nav_motion(enabled, reason=""):
 def recover_map_dirs():
     """Startup recovery for a crash between the two renames of a map
     overwrite: restore .old_* backups whose final directory is missing and
-    remove leftover .staging_* dirs. Called once from the server startup
-    path (P0 audit: the call site must never reference a missing function)."""
+    recover a complete first-save staging package when no committed copy
+    exists. Incomplete staging dirs are discarded. Called once from the
+    server startup path."""
     maps_dir = DATA / "maps"
     if not maps_dir.is_dir():
         return
@@ -580,7 +595,26 @@ def recover_map_dirs():
         else:
             os.replace(backup, final)
     for staging in maps_dir.glob(".staging_*"):
-        shutil.rmtree(staging, ignore_errors=True)
+        map_id = staging.name[len(".staging_"):].rsplit("_", 1)[0]
+        final = maps_dir / map_id
+        metadata = read_json(staging / "metadata.json", {})
+        pcd = staging / "map.pcd"
+        declared_files = (
+            metadata.get(key)
+            for key in ("numpy_map", "database", "trajectory", "nav_map")
+        )
+        complete = bool(
+            map_id
+            and metadata.get("map_id") == map_id
+            and pcd.is_file()
+            and pcd.stat().st_size >= 400
+            and all(not name or (Path(name).name == name and (staging / name).is_file())
+                    for name in declared_files)
+        )
+        if not final.exists() and complete:
+            os.replace(staging, final)
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def active_map_id():
@@ -590,22 +624,15 @@ def active_map_id():
 
 
 def latest_nav_map():
-    """2D nav grid (YAML) of the active map. Package layout first
-    (maps/<map_id>/map.yaml), then the legacy flat layout."""
+    """2D nav grid belonging strictly to the active map (fail-closed)."""
     active = read_json(ACTIVE_MAP_FILE, {}).get("name")
-    if active:
-        packaged = DATA / "maps" / active / "map.yaml"
-        if packaged.is_file():
-            return packaged
-        legacy = DATA / "maps" / (Path(active).stem + ".yaml")
-        if legacy.is_file():
-            return legacy
-    maps = sorted((DATA / "maps").glob("*/map.yaml"),
-                  key=lambda path: path.stat().st_mtime, reverse=True)
-    if maps:
-        return maps[0]
-    maps = sorted((DATA / "maps").glob("*.yaml"), key=lambda path: path.stat().st_mtime, reverse=True)
-    return maps[0] if maps else None
+    if not active:
+        return None
+    packaged = DATA / "maps" / active / "map.yaml"
+    if packaged.is_file():
+        return packaged
+    legacy = DATA / "maps" / (Path(active).stem + ".yaml")
+    return legacy if legacy.is_file() else None
 
 
 def map_inventory():
@@ -666,9 +693,10 @@ def select_map(name):
         meta = read_json(DATA / "maps" / safe / "metadata.json", {})
         if not meta.get("localization_ready", False):
             raise ValueError("该地图缺少重定位数据库，不能激活为导航地图")
+        if not (DATA / "maps" / safe / "map.yaml").is_file():
+            raise ValueError("该地图缺少自身的导航层，不能激活")
     elif legacy.is_file():
-        if not legacy.with_suffix(".yaml").is_file():
-            raise ValueError("该PCD尚未生成导航层")
+        raise ValueError("该地图是没有重定位数据库和坐标版本的旧格式，请重新建图保存后使用")
     else:
         raise ValueError("三维地图不存在")
     write_json(ACTIVE_MAP_FILE, {"name": safe, "updated_at": time.time()})
@@ -834,6 +862,7 @@ def call_c12(path, payload):
 def execute_steps(run_id, task):
     steps = task.get("steps", [])
     checkpoints = {item["id"]: item for item in read_json(CHECKPOINTS_FILE, [])}
+    outcome = "任务结束，运动已切断"
     try:
         for index, step in enumerate(steps):
             if TASK_CANCEL.is_set():
@@ -899,12 +928,20 @@ def execute_steps(run_id, task):
                 capture_c12(task["name"])
         with LOCK:
             TASK_RUN.update(state="completed", step=len(steps), message="任务完成")
+        outcome = "任务完成，运动已切断"
     except InterruptedError as exc:
         with LOCK:
             TASK_RUN.update(state="canceled", message=str(exc))
+        outcome = "任务取消，运动已切断"
     except Exception as exc:
         with LOCK:
             TASK_RUN.update(state="failed", message=str(exc))
+        outcome = "任务失败，运动已切断"
+    finally:
+        # One exit path for every task outcome: never leave a goal or motion
+        # lease alive after an exception, cancellation or completion.
+        set_nav_motion(False, outcome)
+        GOAL_FILE.unlink(missing_ok=True)
 
 
 def start_task(task):
@@ -1218,8 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 if active_mid and loc.get("map_id") != active_mid:
                     raise ValueError("定位所在的地图与活动地图不一致，禁止下发目标")
                 baseline = int(go2_state().get("nav_relay", {}).get("publish_count", 0) or 0)
-                set_nav_motion(True, "导航到：" + point["name"])
                 goal = issue_goal(point)
+                set_nav_motion(True, "导航到：" + point["name"])
                 threading.Thread(target=monitor_navigation_announcement,
                                  args=(goal["id"], baseline), daemon=True).start()
                 self.json_response(200, goal)
@@ -1249,7 +1286,6 @@ class Handler(BaseHTTPRequestHandler):
                         point = next((p for p in read_json(CHECKPOINTS_FILE, []) if p["id"] == step.get("checkpoint_id")), None)
                         if not point or not point_is_navigable(point):
                             raise ValueError("任务包含无效或不可通行的巡查点")
-                set_nav_motion(True, "运行巡逻任务：" + task["name"])
                 self.json_response(200, start_task(task))
             elif path == "/api/tasks/stop":
                 set_nav_motion(False, "用户停止巡逻任务")
