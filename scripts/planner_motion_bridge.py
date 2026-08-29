@@ -203,30 +203,25 @@ class PlannerMotionBridge(Node):
         self.path_start_ok = bool(points)
 
     def localization_ready(self):
-        """Plan A hard gate, FAIL-CLOSED (P0 audit #11): GO2 motion requires
-        a fresh localization_state.json reporting LOCALIZED for the active
-        map. A missing file means the localizer is not running — that is a
-        stop condition, never a bypass."""
-        path = Path("/project/runtime/localization_state.json")
+        """Plan A hard gate, FAIL-CLOSED (P0 audit #11). The decision logic
+        lives in navigation_gate (pure, unit-tested) and is shared with the
+        web goal layer and the task runner — this wrapper only reads the
+        state files and logs."""
         try:
-            loc = json.loads(path.read_text(encoding="utf-8"))
+            loc = json.loads(Path("/project/runtime/localization_state.json")
+                             .read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self.get_logger().error("localization_state.json 缺失：定位未运行，禁止运动",
+            loc = None
+        try:
+            active_map = json.loads(Path("/project/patrol_data/active_map.json")
+                                    .read_text(encoding="utf-8")).get("name")
+        except (OSError, ValueError):
+            active_map = None
+        allowed, reason = navigation_gate(loc, active_map)
+        if not allowed:
+            self.get_logger().error(f"定位门禁禁止运动: {reason}",
                                     throttle_duration_sec=5.0)
-            return False
-        if time.time() - float(loc.get("updated_at", 0)) > 2.0:
-            self.get_logger().error("定位状态过期，禁止运动", throttle_duration_sec=5.0)
-            return False
-        if loc.get("state") != "LOCALIZED" or not loc.get("ok_for_navigation"):
-            return False
-        active_map = json.loads(Path("/project/patrol_data/active_map.json")
-                                .read_text(encoding="utf-8")).get("name")
-        if active_map and loc.get("map_id") != active_map:
-            self.get_logger().error(
-                f"定位地图({loc.get('map_id')})与活动地图({active_map})不一致，禁止运动",
-                throttle_duration_sec=5.0)
-            return False
-        return True
+        return allowed
 
     def enabled(self):
         try:

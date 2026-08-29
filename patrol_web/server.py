@@ -406,7 +406,12 @@ def robot_state():
     # failure even when it accumulated too slowly for the per-frame jump guard.
     alignment = read_json(RUNTIME / "localization_alignment.json", {})
     go2_for_height = read_json(GO2_STATE_FILE, {})
-    if sane and "z" in alignment and time.time() - float(go2_for_height.get("updated_at", 0)) < 2:
+    # The alignment-file height cross-check is only meaningful in MAPPING
+    # mode (fixed leveling TF). In localization mode the dynamic TF owns the
+    # map_level height and a stale alignment z would false-positive.
+    if (sane and "z" in alignment
+            and service_status().get("mapping", {}).get("running")
+            and time.time() - float(go2_for_height.get("updated_at", 0)) < 2):
         reference_height = float(alignment.get("reference_body_height", 0.07))
         expected_z = float(alignment["z"]) + float(go2_for_height.get("body_height", reference_height)) - reference_height
         if abs(values[2] - expected_z) > 0.45:
@@ -1091,10 +1096,22 @@ class Handler(BaseHTTPRequestHandler):
                     # are valid in; __live__ marks it as this session's draft.
                     # (The old mapping-running requirement left points picked
                     # between sessions untagged and invisible everywhere.)
-                    point["session_id"] = session.get("id")
+                    loc = read_json(RUNTIME / "localization_state.json", {})
                     active_mid = active_map_id()
-                    active_meta = read_json(DATA / "maps" / active_mid / "metadata.json", {}) if active_mid else {}
-                    point["map_name"] = active_mid if session.get("running") and active_mid and active_meta.get("session_id") == session.get("id") else "__live__"
+                    loc_ready = (loc.get("state") == "LOCALIZED"
+                                 and loc.get("ok_for_navigation")
+                                 and loc.get("map_id") == active_mid
+                                 and time.time() - float(loc.get("updated_at", 0)) <= 2.0)
+                    if loc_ready:
+                        # Navigation mode: bind straight to the LOCALIZED map
+                        # so a point can never be navigated with another
+                        # map's coordinates.
+                        point["map_name"] = active_mid
+                        point["session_id"] = session.get("id")
+                    elif session.get("running") and active_mid:
+                        # Mapping mode: draft bound to the live session.
+                        point["map_name"] = "__live__"
+                        point["session_id"] = session.get("id")
                 points.append(point); write_json(CHECKPOINTS_FILE, points); self.json_response(200, point)
             elif path == "/api/checkpoints/delete":
                 points = read_json(CHECKPOINTS_FILE, [])
@@ -1124,7 +1141,8 @@ class Handler(BaseHTTPRequestHandler):
                     map_mode = bool(packaged_meta.get("localization_ready"))
                 active_name = active_mid if map_mode else None
                 session_ok = (point.get("map_name") == "__live__" and
-                              point.get("session_id") == mapping_session().get("id"))
+                              point.get("session_id") == mapping_session().get("id") and
+                              service_status().get("mapping", {}).get("running"))
                 if point.get("map_name") != active_name and not session_ok:
                     raise ValueError("该巡查点不属于当前活动地图或本次实时会话，请重新选择")
                 current_pose = robot_state().get("pose", {})

@@ -127,6 +127,18 @@ class Bridge(Node):
         self.recovery_last_write=0.0;self.recovery_last_cloud_time=0.0
         self.create_timer(.25,self.tick); self.create_timer(.25,self.cloud_save_tick); self.create_timer(5.0,self.recovery_tick); self.create_timer(.05,self.teleop_tick); self.create_timer(.05,self.nav_watchdog); self.create_timer(.5,self.write_state)
         self.get_logger().info('Patrol bridge ready, runtime='+str(RUNTIME))
+    def perception_mode(self):
+        """'mapping' | 'localization' | None, from the entry-script marker."""
+        p=RUNTIME/'perception_mode.json'
+        try:
+            mtime=p.stat().st_mtime
+            if mtime!=getattr(self,'_pm_mtime',None):
+                self._pm_mtime=mtime
+                self._pm=json.loads(p.read_text(encoding='utf-8')).get('mode')
+        except (OSError,ValueError):
+            self._pm=None
+        return getattr(self,'_pm',None)
+
     def map_level_transform(self):
         """(4x4 matrix, source) for map_level <- camera_init. source is 'tf'
         (live, from the localization manager or the mapping static TF) or
@@ -157,10 +169,12 @@ class Bridge(Node):
             # correction. Reset the guard baseline instead of latching.
             self._tf_source=tf_source
             self.last_level_sample=None
-        if tf_source=='tf':
-            # With live TF the localizer owns correctness (it gates itself
-            # via LOST/AMBIGUOUS and blocks motion); odometry-vs-TF jumps here
-            # are legal global corrections, never FAST-LIO divergence.
+        if tf_source=='tf' and self.perception_mode()=='localization':
+            # In localization mode the localizer owns correctness (it gates
+            # itself via LOST/AMBIGUOUS and blocks motion); odometry-vs-TF
+            # jumps here are legal global corrections, never divergence.
+            # In MAPPING mode the static TF is live too, and the drift guard
+            # MUST keep running.
             self.last_level_sample=None
         level_position=(matrix@np.array([p.x,p.y,p.z,1.0],dtype=np.float64))[:3]
         roll,pitch,yaw=rpy_from_rotation(matrix[:3,:3]@rotation_from_q(q))
