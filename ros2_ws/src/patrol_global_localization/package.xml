@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>patrol_global_localization</name>
+  <version>0.1.0</version>
+  <description>Scan Context + GICP global relocalization for the GO2 patrol stack</description>
+  <maintainer email="byl@local">byl</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

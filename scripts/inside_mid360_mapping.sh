@@ -36,6 +36,11 @@ if ros2 topic list 2>/dev/null | grep -Fxq /Odometry; then
   exit 3
 fi
 
+# Record the mapping trajectory for the global-localization database (Plan A).
+MAPPING_SESSION_ID=$(python3 -c 'import json
+try: print(json.load(open("/project/runtime/mapping_session.json")).get("id","unknown"))[:8]
+except Exception: print("unknown")')
+PYTHONPATH=/project/ros2_ws/src/patrol_global_localization python3 -m patrol_global_localization.keyframe_saver >> /project/runtime/logs/keyframe_saver.log 2>&1 & PIDS+=($!); NAMES+=(keyframe_saver)
 CLOUD_MAP_TOPIC=/__disabled ODOM_TOPIC=/Odometry ros2 run patrol_bridge bridge > /project/runtime/logs/patrol_bridge.log 2>&1 & PIDS+=($!); NAMES+=(patrol_bridge)
 mkdir -p /project/runtime/cloud_bridge
 PATROL_RUNTIME=/project/runtime/cloud_bridge ODOM_TOPIC=/__disabled \
